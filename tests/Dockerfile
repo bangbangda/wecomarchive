@@ -1,5 +1,7 @@
 # Dockerfile for building and testing wecomarchive extension
-FROM php:8.0-cli
+# Build from project root: docker build -f tests/Dockerfile .
+ARG PHP_VERSION=8.0
+FROM php:${PHP_VERSION}-cli
 
 # Install dependencies
 RUN apt-get update && apt-get install -y \
@@ -10,7 +12,9 @@ RUN apt-get update && apt-get install -y \
 
 # Copy extension source
 WORKDIR /ext
-COPY . .
+COPY wecomarchive.c php_wecomarchive.h config.m4 ./
+COPY scripts ./scripts/
+COPY tests/test.php ./tests/
 
 # Download WeCom SDK
 RUN chmod +x scripts/download-sdk.sh && ./scripts/download-sdk.sh
@@ -27,4 +31,5 @@ RUN echo "extension=wecomarchive.so" > /usr/local/etc/php/conf.d/wecomarchive.in
 # Verify installation
 RUN php -m | grep wecomarchive
 
-CMD ["php", "-i"]
+# Run tests by default
+CMD ["php", "/ext/tests/test.php"]

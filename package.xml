@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<package packagerversion="1.10.15" version="2.0" xmlns="http://pear.php.net/dtd/package-2.0" xmlns:tasks="http://pear.php.net/dtd/tasks-1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://pear.php.net/dtd/tasks-1.0 http://pear.php.net/dtd/tasks-1.0.xsd http://pear.php.net/dtd/package-2.0 http://pear.php.net/dtd/package-2.0.xsd">
+ <name>wecomarchive</name>
+ <channel>pecl.php.net</channel>
+ <summary>WeCom (WeChat Work) Chat Archive SDK wrapper</summary>
+ <description>
+  PHP extension for WeCom (WeChat Work) Chat Archive functionality.
+  This extension provides a simple object-oriented interface to access
+  WeCom's chat archive API, allowing you to fetch chat messages,
+  decrypt message content, and download media files.
+ </description>
+ <lead>
+  <name>Hossy</name>
+  <email>hi@qiyuankeji.cn</email>
+  <active>yes</active>
+ </lead>
+ <date>2025-01-05</date>
+ <time>09:00:00</time>
+ <version>
+  <release>1.0.0</release>
+  <api>1.0.0</api>
+ </version>
+ <stability>
+  <release>stable</release>
+  <api>stable</api>
+ </stability>
+ <license uri="http://www.php.net/license/3_01.txt">PHP License</license>
+ <notes>
+  Initial release:
+  - WeComArchive class with OOP interface
+  - getChatData() - Fetch chat messages
+  - decryptData() - Decrypt message content with RSA private key
+  - getMediaData() - Download media files
+  - Auto-download SDK from official CDN during installation
+  - Support for proxy configuration
+ </notes>
+ <contents>
+  <dir name="/">
+   <file name="config.m4" role="src" />
+   <file name="php_wecomarchive.h" role="src" />
+   <file name="wecomarchive.c" role="src" />
+   <file name="LICENSE" role="doc" />
+   <file name="README.md" role="doc" />
+   <dir name="scripts">
+    <file name="download-sdk.sh" role="script" />
+   </dir>
+  </dir>
+ </contents>
+ <dependencies>
+  <required>
+   <php>
+    <min>8.0.0</min>
+   </php>
+   <pearinstaller>
+    <min>1.10.0</min>
+   </pearinstaller>
+  </required>
+ </dependencies>
+ <providesextension>wecomarchive</providesextension>
+ <extsrcrelease>
+  <configureoption default="/usr/local/lib/libWeWorkFinanceSdk_C.so" name="with-wecomarchive-sdk" prompt="Path to WeCom SDK library" />
+ </extsrcrelease>
+</package>

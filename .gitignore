@@ -1,0 +1,45 @@
+# Build artifacts
+*.lo
+*.la
+*.o
+*.so
+.libs/
+modules/
+
+# PHP extension build
+.deps
+Makefile
+Makefile.fragments
+Makefile.global
+Makefile.objects
+acinclude.m4
+aclocal.m4
+autom4te.cache/
+build/
+config.guess
+config.h
+config.h.in
+config.log
+config.nice
+config.status
+config.sub
+configure
+configure.ac
+install-sh
+libtool
+ltmain.sh
+missing
+mkinstalldirs
+run-tests.php
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# SDK library (downloaded separately)
+libWeWorkFinanceSdk_C.so

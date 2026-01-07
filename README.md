@@ -1,6 +1,19 @@
 # wecomarchive
 
+English | **[简体中文](README_CN.md)**
+
+> 📖 **中国用户请查看 [中文文档](README_CN.md) →**
+
 PHP extension for WeCom (WeChat Work) Chat Archive functionality.
+
+> **Install with [PIE](https://github.com/php/pie)**: `pie install bangbangda/wecomarchive`
+
+## Features
+
+- **Automatic SDK Download**: WeCom SDK is automatically downloaded during installation
+- **Object-Oriented Interface**: Clean, modern PHP API for chat archive operations
+- **Full Functionality**: Fetch messages, decrypt content, download media files
+- **Flexible Configuration**: Support for custom SDK paths and proxy settings
 
 ## Requirements
 
@@ -10,16 +23,39 @@ PHP extension for WeCom (WeChat Work) Chat Archive functionality.
 
 ## Installation
 
-### Method 1: PECL (Recommended)
+### Method 1: PIE (Recommended)
+
+[PIE](https://github.com/php/pie) is the modern way to install PHP extensions.
+
+**Basic Installation (Automatic):**
 
 ```bash
-pecl install wecomarchive
+# Install PIE if you haven't already
+composer global require php/pie
+
+# Install the extension (SDK will be downloaded automatically)
+pie install bangbangda/wecomarchive
 ```
 
-After installation, run the SDK download script:
+The WeCom SDK will be **automatically downloaded** during installation to `/usr/local/lib/`.
+
+**Advanced Configuration:**
+
+If you need to customize the SDK path or the automatic download fails:
 
 ```bash
-wecomarchive-download-sdk
+# Specify custom SDK library path
+pie install bangbangda/wecomarchive --with-wecomarchive-sdk-path=/custom/lib/path
+
+# Then manually download SDK to your custom path
+vendor/bin/download-sdk.sh --path /custom/lib/path
+```
+
+**Note:** If automatic download fails due to permission issues, you may need to run:
+
+```bash
+# Download SDK manually with sudo
+sudo ./scripts/download-sdk.sh
 ```
 
 ### Method 2: Manual Installation
@@ -27,18 +63,11 @@ wecomarchive-download-sdk
 1. Download and extract the source:
 
 ```bash
-git clone https://github.com/yourname/wecomarchive.git
+git clone https://github.com/bangbangda/wecomarchive.git
 cd wecomarchive
 ```
 
-2. Download the WeCom SDK:
-
-```bash
-chmod +x scripts/download-sdk.sh
-./scripts/download-sdk.sh
-```
-
-3. Build the extension:
+2. Build the extension (SDK will be downloaded automatically during configure):
 
 ```bash
 phpize
@@ -47,7 +76,27 @@ make
 sudo make install
 ```
 
-4. Enable the extension in php.ini:
+**The WeCom SDK will be automatically downloaded to `/usr/local/lib/` during the `./configure` step.**
+
+If you want to use a custom SDK path:
+
+```bash
+phpize
+./configure --with-wecomarchive-sdk-path=/custom/lib/path
+make
+sudo make install
+```
+
+If automatic download fails, you can manually download the SDK first:
+
+```bash
+chmod +x scripts/download-sdk.sh
+./scripts/download-sdk.sh
+# Or with custom path
+./scripts/download-sdk.sh --path /custom/path
+```
+
+3. Enable the extension in php.ini:
 
 ```ini
 extension=wecomarchive.so

@@ -1,0 +1,36 @@
+{
+    "name": "bangbangda/wecomarchive",
+    "description": "PHP extension for WeCom (WeChat Work) Chat Archive functionality. Provides object-oriented interface to fetch chat messages, decrypt content, and download media files.",
+    "type": "php-ext",
+    "keywords": ["wecom", "wechat", "wework", "chat", "archive", "enterprise", "extension"],
+    "homepage": "https://github.com/bangbangda/wecomarchive",
+    "license": "PHP-3.01",
+    "authors": [
+        {
+            "name": "Hossy",
+            "email": "hi@qiyuankeji.cn"
+        }
+    ],
+    "require": {
+        "php": ">=8.0"
+    },
+    "bin": [
+        "scripts/download-sdk.sh"
+    ],
+    "extra": {
+        "php-ext": {
+            "extension-name": "wecomarchive",
+            "priority": 50,
+            "support-zts": true,
+            "support-nts": true,
+            "os-families": ["linux"],
+            "configure-options": [
+                {
+                    "name": "with-wecomarchive-sdk-path",
+                    "description": "Path to WeCom SDK library directory (default: /usr/local/lib)",
+                    "default": "/usr/local/lib"
+                }
+            ]
+        }
+    }
+}

@@ -113,11 +113,11 @@ wecomarchive.sdk_lib_path=/usr/local/lib/libWeWorkFinanceSdk_C.so
 
 ```php
 <?php
-// 使用你的凭据初始化
+// 使用你的凭据初始化（私钥支持 PEM 字符串或文件路径，自动识别）
 $archive = new WeComArchive([
     'corpid' => 'your_corp_id',
     'secret' => 'your_secret',
-    'private_key' => file_get_contents('/path/to/private.pem'),
+    'private_key' => '/path/to/private.pem', // 或直接传 PEM 内容
 ]);
 
 // 获取聊天数据
@@ -136,6 +136,36 @@ if ($data['errcode'] === 0) {
     }
 }
 ```
+
+### 多版本私钥（推荐）
+
+企微后台支持轮换私钥，每条 chatdata 中带有 `publickey_ver` 字段。配置 `private_keys` 后，扩展会按版本号自动选择对应私钥：
+
+```php
+<?php
+$archive = new WeComArchive([
+    'corpid' => 'your_corp_id',
+    'secret' => 'your_secret',
+    // [publickey_ver => PEM 字符串或文件路径]
+    'private_keys' => [
+        1 => '/path/to/key_v1.pem',
+        2 => '/path/to/key_v2.pem',
+        3 => "-----BEGIN PRIVATE KEY-----\n...",
+    ],
+]);
+
+$response = $archive->getChatData(0, 100);
+$data = json_decode($response, true);
+
+foreach ($data['chatdata'] as $chat) {
+    // 直接传整条 chatdata 项即可，扩展自动按 publickey_ver 选私钥
+    $message = $archive->decryptChatItem($chat);
+    $msgData = json_decode($message, true);
+    print_r($msgData);
+}
+```
+
+如果 `publickey_ver` 在 `private_keys` 中找不到对应私钥，会抛出明确异常并指出缺失的版本号。
 
 ### 下载媒体文件
 
@@ -192,8 +222,11 @@ public function __construct(array $options)
 **参数：**
 - `corpid`（必需）：企业微信 Corp ID
 - `secret`（必需）：会话存档 secret
-- `private_key`（可选）：用于解密的 RSA 私钥
+- `private_key`（可选）：单个 RSA 私钥，可传 PEM 内容字符串或 PEM 文件路径（自动识别）。`decryptData` 使用此私钥
+- `private_keys`（可选）：多版本私钥映射 `[publickey_ver => PEM 字符串或文件路径]`。`decryptChatItem` 按版本号自动选择
 - `lib_path`（可选）：SDK 库的自定义路径
+
+> 说明：值若以 `-----BEGIN ` 开头视为 PEM 内容，否则视为文件路径。`private_key` 与 `private_keys` 可同时设置，前者作为 `decryptChatItem` 的兜底。
 
 #### getChatData
 
@@ -216,13 +249,33 @@ public function getChatData(int $seq = 0, int $limit = 100, array $options = [])
 public function decryptData(string $encryptRandomKey, string $encryptChatMsg): string
 ```
 
-解密聊天消息。
+使用构造时传入的 `private_key` 解密一条聊天消息。
 
 **参数：**
 - `$encryptRandomKey`：聊天数据中的 `encrypt_random_key`
 - `$encryptChatMsg`：聊天数据中的 `encrypt_chat_msg`
 
 **返回：** 解密后的消息 JSON 字符串
+
+**抛出：** 若构造时未传 `private_key`，会抛 `WECOM_ERR_PRIKEY` 异常并提示。
+
+#### decryptChatItem
+
+```php
+public function decryptChatItem(array $chatItem): string
+```
+
+解密单条 chatdata 数组项，自动按 `publickey_ver` 从 `private_keys` 中选择对应私钥。
+
+**参数：**
+- `$chatItem`：`getChatData` 返回的 `chatdata` 数组中的一项，至少需包含 `encrypt_random_key`、`encrypt_chat_msg` 字段；如带 `publickey_ver` 则按版本号自动选私钥
+
+**返回：** 解密后的消息 JSON 字符串
+
+**抛出：**
+- 未配置任何私钥 → `WECOM_ERR_PRIKEY`，提示传入 `private_keys` 或 `private_key`
+- `publickey_ver` 在 `private_keys` 中找不到 → `WECOM_ERR_PRIKEY`，错误信息包含具体版本号
+- chat 项缺少必需字段 → `WECOM_ERR_PARAM`
 
 #### getMediaData
 

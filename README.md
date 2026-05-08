@@ -115,11 +115,12 @@ wecomarchive.sdk_lib_path=/usr/local/lib/libWeWorkFinanceSdk_C.so
 
 ```php
 <?php
-// Initialize with your credentials
+// Initialize with your credentials. private_key accepts either PEM content or a file path
+// (auto-detected — values starting with "-----BEGIN " are treated as PEM content).
 $archive = new WeComArchive([
     'corpid' => 'your_corp_id',
     'secret' => 'your_secret',
-    'private_key' => file_get_contents('/path/to/private.pem'),
+    'private_key' => '/path/to/private.pem', // or raw PEM string
 ]);
 
 // Fetch chat data
@@ -138,6 +139,39 @@ if ($data['errcode'] === 0) {
     }
 }
 ```
+
+### Multi-version Private Keys (Recommended)
+
+WeCom supports rotating the chat-archive private key. Each chat item carries a `publickey_ver`
+field. Configure `private_keys` and use `decryptChatItem()` to let the extension auto-select
+the correct private key for each item:
+
+```php
+<?php
+$archive = new WeComArchive([
+    'corpid' => 'your_corp_id',
+    'secret' => 'your_secret',
+    // [publickey_ver => PEM content or file path]
+    'private_keys' => [
+        1 => '/path/to/key_v1.pem',
+        2 => '/path/to/key_v2.pem',
+        3 => "-----BEGIN PRIVATE KEY-----\n...",
+    ],
+]);
+
+$response = $archive->getChatData(0, 100);
+$data = json_decode($response, true);
+
+foreach ($data['chatdata'] as $chat) {
+    // Pass the whole chat item — extension picks the key by publickey_ver automatically.
+    $message = $archive->decryptChatItem($chat);
+    $msgData = json_decode($message, true);
+    print_r($msgData);
+}
+```
+
+If `publickey_ver` cannot be matched in `private_keys`, a clear exception is thrown
+naming the missing version.
 
 ### Download Media Files
 
@@ -194,8 +228,11 @@ public function __construct(array $options)
 **Options:**
 - `corpid` (required): Your WeCom Corp ID
 - `secret` (required): Chat archive secret
-- `private_key` (optional): RSA private key for decryption
+- `private_key` (optional): A single RSA private key. Accepts either PEM content or a file path (auto-detected). Used by `decryptData()`
+- `private_keys` (optional): Multi-version key map `[publickey_ver => PEM-or-path]`. Used by `decryptChatItem()` for auto-selection
 - `lib_path` (optional): Custom path to SDK library
+
+> Detection rule: if a value starts with `-----BEGIN `, it's treated as PEM content; otherwise it's treated as a file path. `private_key` and `private_keys` may both be set — the former acts as a fallback for `decryptChatItem()`.
 
 #### getChatData
 
@@ -218,13 +255,33 @@ Fetch chat messages.
 public function decryptData(string $encryptRandomKey, string $encryptChatMsg): string
 ```
 
-Decrypt a chat message.
+Decrypt a chat message using the `private_key` provided at construction time.
 
 **Parameters:**
 - `$encryptRandomKey`: The `encrypt_random_key` from chat data
 - `$encryptChatMsg`: The `encrypt_chat_msg` from chat data
 
 **Returns:** Decrypted message as JSON string
+
+**Throws:** `WECOM_ERR_PRIKEY` if no `private_key` was configured.
+
+#### decryptChatItem
+
+```php
+public function decryptChatItem(array $chatItem): string
+```
+
+Decrypt one chatdata item, auto-selecting the private key from `private_keys` by its `publickey_ver`.
+
+**Parameters:**
+- `$chatItem`: One element from the `chatdata` array returned by `getChatData()`. Must contain `encrypt_random_key` and `encrypt_chat_msg`; if `publickey_ver` is present it is used to pick the matching key from `private_keys`
+
+**Returns:** Decrypted message as JSON string
+
+**Throws:**
+- `WECOM_ERR_PRIKEY` — no key configured at all (neither `private_keys` nor `private_key`)
+- `WECOM_ERR_PRIKEY` — `publickey_ver` not found in `private_keys` (error message names the missing version)
+- `WECOM_ERR_PARAM` — chat item is missing required fields
 
 #### getMediaData
 

@@ -34,7 +34,7 @@ test(
 );
 
 // Test 3: Check methods exist
-$methods = ['__construct', 'getChatData', 'decryptData', 'getMediaData', 'getSdkVersion'];
+$methods = ['__construct', 'getChatData', 'decryptData', 'decryptChatItem', 'getMediaData', 'getSdkVersion'];
 foreach ($methods as $method) {
     test(
         "Method {$method}() exists",
@@ -122,6 +122,66 @@ test(
     $ini !== false && strlen($ini) > 0,
     "Got: " . var_export($ini, true)
 );
+
+// Test 10: private_keys validation — wrong type
+try {
+    new WeComArchive([
+        'corpid' => 'test', 'secret' => 'test',
+        'private_keys' => 'not-an-array',
+    ]);
+    test("private_keys type check rejects string", false, "Should have thrown");
+} catch (Exception $e) {
+    test(
+        "private_keys type check rejects string",
+        strpos($e->getMessage(), 'private_keys') !== false,
+        $e->getMessage()
+    );
+}
+
+// Test 11: private_keys validation — empty array
+try {
+    new WeComArchive([
+        'corpid' => 'test', 'secret' => 'test',
+        'private_keys' => [],
+    ]);
+    test("private_keys rejects empty array", false, "Should have thrown");
+} catch (Exception $e) {
+    test(
+        "private_keys rejects empty array",
+        strpos($e->getMessage(), 'empty') !== false,
+        $e->getMessage()
+    );
+}
+
+// Test 12: private_key as nonexistent file path → clear error
+try {
+    new WeComArchive([
+        'corpid' => 'test', 'secret' => 'test',
+        'private_key' => '/nonexistent/path/to/key.pem',
+    ]);
+    test("private_key nonexistent path rejected", false, "Should have thrown");
+} catch (Exception $e) {
+    test(
+        "private_key nonexistent path rejected",
+        strpos($e->getMessage(), 'private_key') !== false,
+        $e->getMessage()
+    );
+}
+
+// Test 13: private_keys[ver] with bad path → error mentions version
+try {
+    new WeComArchive([
+        'corpid' => 'test', 'secret' => 'test',
+        'private_keys' => [42 => '/nonexistent/key.pem'],
+    ]);
+    test("private_keys bad path mentions version", false, "Should have thrown");
+} catch (Exception $e) {
+    test(
+        "private_keys bad path mentions version",
+        strpos($e->getMessage(), '42') !== false,
+        $e->getMessage()
+    );
+}
 
 // Summary
 echo "\n=== Test Summary ===\n";

@@ -20,12 +20,18 @@
 #include "ext/standard/info.h"
 #include "zend_exceptions.h"
 #include "zend_smart_str.h"
+#include "php_streams.h"
 #include "php_wecomarchive.h"
 
 #include <dlfcn.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
+
+/* Error codes (mirrors REGISTER_LONG_CONSTANT in MINIT) */
+#define WECOM_ERR_PARAM   10000
+#define WECOM_ERR_DECRYPT 10006
+#define WECOM_ERR_PRIKEY  10007
 
 ZEND_DECLARE_MODULE_GLOBALS(wecomarchive)
 
@@ -76,8 +82,12 @@ static zend_object_handlers wecomarchive_object_handlers;
 
 typedef struct {
     WeWorkFinanceSdk_t *sdk;
-    char *private_key;
-    size_t private_key_len;
+    /* Optional single key (BC: from constructor option "private_key"). Used by decryptData
+       and as fallback in decryptChatItem when no publickey_ver is present. */
+    zend_string *default_key;
+    /* Optional version-keyed map (from constructor option "private_keys").
+       Stores zend_string PEM contents indexed by integer publickey_ver. */
+    HashTable *private_keys;
     zend_object std;
 } wecomarchive_object;
 
@@ -206,6 +216,39 @@ static char *rsa_decrypt(const char *private_key, size_t private_key_len, const 
     return (char *)decrypted;
 }
 
+/* Resolve a private key source: if value starts with "-----BEGIN" treat as PEM content,
+   otherwise treat as a file path and read its contents. Returns a new zend_string (caller
+   owns the reference) or NULL on failure with err_buf populated. */
+static zend_string *resolve_private_key_source(const char *src, size_t src_len, char *err_buf, size_t err_buf_size) {
+    if (src_len >= 11 && memcmp(src, "-----BEGIN ", 11) == 0) {
+        return zend_string_init(src, src_len, 0);
+    }
+
+    /* Treat as file path. Use php_stream so it respects open_basedir and supports user wrappers. */
+    php_stream *stream = php_stream_open_wrapper((char *)src, "rb", REPORT_ERRORS, NULL);
+    if (!stream) {
+        snprintf(err_buf, err_buf_size, "failed to open private key file '%s'", src);
+        return NULL;
+    }
+
+    zend_string *contents = php_stream_copy_to_mem(stream, PHP_STREAM_COPY_ALL, 0);
+    php_stream_close(stream);
+
+    if (!contents || ZSTR_LEN(contents) == 0) {
+        if (contents) zend_string_release(contents);
+        snprintf(err_buf, err_buf_size, "private key file '%s' is empty or unreadable", src);
+        return NULL;
+    }
+
+    if (ZSTR_LEN(contents) < 11 || strstr(ZSTR_VAL(contents), "-----BEGIN ") == NULL) {
+        zend_string_release(contents);
+        snprintf(err_buf, err_buf_size, "file '%s' does not contain a PEM private key", src);
+        return NULL;
+    }
+
+    return contents;
+}
+
 /* Object handlers */
 static zend_object *wecomarchive_object_create(zend_class_entry *ce) {
     wecomarchive_object *intern = zend_object_alloc(sizeof(wecomarchive_object), ce);
@@ -215,8 +258,8 @@ static zend_object *wecomarchive_object_create(zend_class_entry *ce) {
 
     intern->std.handlers = &wecomarchive_object_handlers;
     intern->sdk = NULL;
-    intern->private_key = NULL;
-    intern->private_key_len = 0;
+    intern->default_key = NULL;
+    intern->private_keys = NULL;
 
     return &intern->std;
 }
@@ -229,9 +272,15 @@ static void wecomarchive_object_free(zend_object *object) {
         intern->sdk = NULL;
     }
 
-    if (intern->private_key) {
-        efree(intern->private_key);
-        intern->private_key = NULL;
+    if (intern->default_key) {
+        zend_string_release(intern->default_key);
+        intern->default_key = NULL;
+    }
+
+    if (intern->private_keys) {
+        zend_hash_destroy(intern->private_keys);
+        efree(intern->private_keys);
+        intern->private_keys = NULL;
     }
 
     zend_object_std_dtor(&intern->std);
@@ -242,9 +291,14 @@ static void wecomarchive_object_free(zend_object *object) {
 PHP_METHOD(WeComArchive, __construct)
 {
     zval *options;
-    zend_string *corpid = NULL, *secret = NULL, *private_key = NULL, *lib_path = NULL;
+    zend_string *corpid = NULL, *secret = NULL, *lib_path = NULL;
+    zval *private_key_zv = NULL, *private_keys_zv = NULL;
     HashTable *options_ht;
     zval *tmp;
+
+    /* Pre-loaded keys (released or transferred to intern at end) */
+    zend_string *loaded_default_key = NULL;
+    HashTable *loaded_private_keys = NULL;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ARRAY(options)
@@ -268,21 +322,94 @@ PHP_METHOD(WeComArchive, __construct)
     }
     secret = Z_STR_P(tmp);
 
-    /* Get optional private_key */
-    tmp = zend_hash_str_find(options_ht, "private_key", sizeof("private_key") - 1);
-    if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
-        private_key = Z_STR_P(tmp);
+    /* Optional: private_key (single, BC; accepts PEM content or file path) */
+    private_key_zv = zend_hash_str_find(options_ht, "private_key", sizeof("private_key") - 1);
+    if (private_key_zv && Z_TYPE_P(private_key_zv) != IS_STRING) {
+        zend_throw_exception(zend_ce_exception, "Option 'private_key' must be a string (PEM content or file path)", 0);
+        RETURN_THROWS();
     }
 
-    /* Get optional lib_path */
+    /* Optional: private_keys (multi-version map [ver => PEM-or-path]) */
+    private_keys_zv = zend_hash_str_find(options_ht, "private_keys", sizeof("private_keys") - 1);
+    if (private_keys_zv && Z_TYPE_P(private_keys_zv) != IS_ARRAY) {
+        zend_throw_exception(zend_ce_exception, "Option 'private_keys' must be an array of [version => PEM-or-path]", 0);
+        RETURN_THROWS();
+    }
+
+    /* Optional lib_path */
     tmp = zend_hash_str_find(options_ht, "lib_path", sizeof("lib_path") - 1);
     if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
         lib_path = Z_STR_P(tmp);
     }
 
+    /* Pre-load private_key (BC) */
+    if (private_key_zv) {
+        char err_buf[512];
+        loaded_default_key = resolve_private_key_source(Z_STRVAL_P(private_key_zv), Z_STRLEN_P(private_key_zv), err_buf, sizeof(err_buf));
+        if (!loaded_default_key) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PRIKEY, "Option 'private_key' invalid: %s", err_buf);
+            RETURN_THROWS();
+        }
+    }
+
+    /* Pre-load private_keys map */
+    if (private_keys_zv) {
+        HashTable *src_ht = Z_ARRVAL_P(private_keys_zv);
+        if (zend_hash_num_elements(src_ht) == 0) {
+            if (loaded_default_key) zend_string_release(loaded_default_key);
+            zend_throw_exception(zend_ce_exception, "Option 'private_keys' must not be empty", 0);
+            RETURN_THROWS();
+        }
+
+        loaded_private_keys = (HashTable *)emalloc(sizeof(HashTable));
+        zend_hash_init(loaded_private_keys, zend_hash_num_elements(src_ht), NULL, ZVAL_PTR_DTOR, 0);
+
+        zend_ulong num_idx;
+        zend_string *str_idx;
+        zval *entry;
+
+        ZEND_HASH_FOREACH_KEY_VAL(src_ht, num_idx, str_idx, entry) {
+            if (str_idx) {
+                /* String key: must be numeric */
+                if (!is_numeric_string(ZSTR_VAL(str_idx), ZSTR_LEN(str_idx), NULL, NULL, 0)) {
+                    zend_hash_destroy(loaded_private_keys);
+                    efree(loaded_private_keys);
+                    if (loaded_default_key) zend_string_release(loaded_default_key);
+                    zend_throw_exception_ex(zend_ce_exception, 0, "Option 'private_keys' key '%s' must be a numeric publickey_ver", ZSTR_VAL(str_idx));
+                    RETURN_THROWS();
+                }
+                num_idx = (zend_ulong)ZEND_STRTOL(ZSTR_VAL(str_idx), NULL, 10);
+            }
+
+            if (Z_TYPE_P(entry) != IS_STRING) {
+                zend_hash_destroy(loaded_private_keys);
+                efree(loaded_private_keys);
+                if (loaded_default_key) zend_string_release(loaded_default_key);
+                zend_throw_exception_ex(zend_ce_exception, 0, "Option 'private_keys[%lld]' must be a string (PEM content or file path)", (long long)num_idx);
+                RETURN_THROWS();
+            }
+
+            char err_buf[512];
+            zend_string *pem = resolve_private_key_source(Z_STRVAL_P(entry), Z_STRLEN_P(entry), err_buf, sizeof(err_buf));
+            if (!pem) {
+                zend_hash_destroy(loaded_private_keys);
+                efree(loaded_private_keys);
+                if (loaded_default_key) zend_string_release(loaded_default_key);
+                zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PRIKEY, "Option 'private_keys[%lld]' invalid: %s", (long long)num_idx, err_buf);
+                RETURN_THROWS();
+            }
+
+            zval pem_zv;
+            ZVAL_STR(&pem_zv, pem);
+            zend_hash_index_update(loaded_private_keys, num_idx, &pem_zv);
+        } ZEND_HASH_FOREACH_END();
+    }
+
     /* Load SDK library */
     const char *sdk_path = lib_path ? ZSTR_VAL(lib_path) : WECOMARCHIVE_G(sdk_lib_path);
     if (load_sdk_library(sdk_path) == FAILURE) {
+        if (loaded_default_key) zend_string_release(loaded_default_key);
+        if (loaded_private_keys) { zend_hash_destroy(loaded_private_keys); efree(loaded_private_keys); }
         zend_throw_exception_ex(zend_ce_exception, 0, "Failed to load SDK library from: %s", sdk_path);
         RETURN_THROWS();
     }
@@ -292,6 +419,8 @@ PHP_METHOD(WeComArchive, __construct)
     /* Create SDK instance */
     intern->sdk = fn_NewSdk();
     if (!intern->sdk) {
+        if (loaded_default_key) zend_string_release(loaded_default_key);
+        if (loaded_private_keys) { zend_hash_destroy(loaded_private_keys); efree(loaded_private_keys); }
         zend_throw_exception(zend_ce_exception, "Failed to create SDK instance", 0);
         RETURN_THROWS();
     }
@@ -301,15 +430,15 @@ PHP_METHOD(WeComArchive, __construct)
     if (ret != 0) {
         fn_DestroySdk(intern->sdk);
         intern->sdk = NULL;
+        if (loaded_default_key) zend_string_release(loaded_default_key);
+        if (loaded_private_keys) { zend_hash_destroy(loaded_private_keys); efree(loaded_private_keys); }
         zend_throw_exception_ex(zend_ce_exception, ret, "Failed to initialize SDK, error code: %d", ret);
         RETURN_THROWS();
     }
 
-    /* Store private key if provided */
-    if (private_key) {
-        intern->private_key = estrndup(ZSTR_VAL(private_key), ZSTR_LEN(private_key));
-        intern->private_key_len = ZSTR_LEN(private_key);
-    }
+    /* Transfer ownership of pre-loaded keys onto the object */
+    intern->default_key = loaded_default_key;
+    intern->private_keys = loaded_private_keys;
 }
 /* }}} */
 
@@ -387,16 +516,19 @@ PHP_METHOD(WeComArchive, decryptData)
 
     wecomarchive_object *intern = Z_WECOMARCHIVE_P(ZEND_THIS);
 
-    if (!intern->private_key) {
-        zend_throw_exception(zend_ce_exception, "Private key not set. Please provide 'private_key' in constructor options.", 0);
+    if (!intern->default_key) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PRIKEY,
+            "Private key not set. Pass 'private_key' to the constructor, "
+            "or use decryptChatItem() with 'private_keys' for multi-version keys.");
         RETURN_THROWS();
     }
 
     /* Decrypt the encrypt_random_key using RSA private key */
     size_t decrypted_key_len;
-    char *decrypted_key = rsa_decrypt(intern->private_key, intern->private_key_len, ZSTR_VAL(encrypt_random_key), &decrypted_key_len);
+    char *decrypted_key = rsa_decrypt(ZSTR_VAL(intern->default_key), ZSTR_LEN(intern->default_key), ZSTR_VAL(encrypt_random_key), &decrypted_key_len);
     if (!decrypted_key) {
-        zend_throw_exception(zend_ce_exception, "Failed to decrypt encrypt_random_key with RSA private key", 0);
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_DECRYPT,
+            "RSA decryption of encrypt_random_key failed (wrong private key, or malformed encrypt_random_key)");
         RETURN_THROWS();
     }
 
@@ -409,6 +541,120 @@ PHP_METHOD(WeComArchive, decryptData)
     }
 
     int ret = fn_DecryptData(decrypted_key, ZSTR_VAL(encrypt_chat_msg), msg);
+    efree(decrypted_key);
+
+    if (ret != 0) {
+        fn_FreeSlice(msg);
+        zend_throw_exception_ex(zend_ce_exception, ret, "Failed to decrypt message, error code: %d", ret);
+        RETURN_THROWS();
+    }
+
+    RETVAL_STRINGL(msg->buf, msg->len);
+    fn_FreeSlice(msg);
+}
+/* }}} */
+
+/* {{{ proto string WeComArchive::decryptChatItem(array $chatItem)
+   Decrypt one chatdata item, auto-selecting the private key by its publickey_ver. */
+PHP_METHOD(WeComArchive, decryptChatItem)
+{
+    zval *chat_item;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY(chat_item)
+    ZEND_PARSE_PARAMETERS_END();
+
+    HashTable *item_ht = Z_ARRVAL_P(chat_item);
+    zval *enc_rand_key_zv = zend_hash_str_find(item_ht, "encrypt_random_key", sizeof("encrypt_random_key") - 1);
+    zval *enc_msg_zv     = zend_hash_str_find(item_ht, "encrypt_chat_msg",   sizeof("encrypt_chat_msg") - 1);
+    zval *pub_ver_zv     = zend_hash_str_find(item_ht, "publickey_ver",      sizeof("publickey_ver") - 1);
+
+    if (!enc_rand_key_zv || Z_TYPE_P(enc_rand_key_zv) != IS_STRING) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PARAM,
+            "Chat item missing string field 'encrypt_random_key'");
+        RETURN_THROWS();
+    }
+    if (!enc_msg_zv || Z_TYPE_P(enc_msg_zv) != IS_STRING) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PARAM,
+            "Chat item missing string field 'encrypt_chat_msg'");
+        RETURN_THROWS();
+    }
+
+    wecomarchive_object *intern = Z_WECOMARCHIVE_P(ZEND_THIS);
+
+    /* Must have at least one key configured */
+    if (!intern->private_keys && !intern->default_key) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PRIKEY,
+            "No private key configured. Pass 'private_keys' (recommended) or 'private_key' to the WeComArchive constructor.");
+        RETURN_THROWS();
+    }
+
+    /* Resolve which key to use. Priority: private_keys[publickey_ver] > default_key */
+    zend_string *pem_to_use = NULL;
+    zend_long ver = 0;
+    int has_ver = 0;
+
+    if (pub_ver_zv) {
+        if (Z_TYPE_P(pub_ver_zv) == IS_LONG) {
+            ver = Z_LVAL_P(pub_ver_zv);
+            has_ver = 1;
+        } else if (Z_TYPE_P(pub_ver_zv) == IS_STRING && is_numeric_string(Z_STRVAL_P(pub_ver_zv), Z_STRLEN_P(pub_ver_zv), NULL, NULL, 0)) {
+            ver = (zend_long)ZEND_STRTOL(Z_STRVAL_P(pub_ver_zv), NULL, 10);
+            has_ver = 1;
+        }
+    }
+
+    if (has_ver && intern->private_keys) {
+        zval *found = zend_hash_index_find(intern->private_keys, (zend_ulong)ver);
+        if (found && Z_TYPE_P(found) == IS_STRING) {
+            pem_to_use = Z_STR_P(found);
+        } else {
+            /* Version was provided but not configured. Fall back only if private_keys is the
+               sole configuration source — otherwise honor the explicit version request. */
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PRIKEY,
+                "Private key for publickey_ver=%lld not configured. "
+                "Add it to the 'private_keys' constructor option.", (long long)ver);
+            RETURN_THROWS();
+        }
+    } else if (intern->default_key) {
+        /* No version in chat item, or only a single 'private_key' configured: use default */
+        pem_to_use = intern->default_key;
+    } else if (intern->private_keys && zend_hash_num_elements(intern->private_keys) == 1) {
+        /* Single-entry private_keys with no usable version info: use the only entry */
+        zval *only;
+        ZEND_HASH_FOREACH_VAL(intern->private_keys, only) {
+            pem_to_use = Z_STR_P(only);
+            break;
+        } ZEND_HASH_FOREACH_END();
+    } else {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PARAM,
+            "Chat item is missing a usable 'publickey_ver' and no default 'private_key' is configured.");
+        RETURN_THROWS();
+    }
+
+    /* RSA-decrypt the random key */
+    size_t decrypted_key_len;
+    char *decrypted_key = rsa_decrypt(ZSTR_VAL(pem_to_use), ZSTR_LEN(pem_to_use), Z_STRVAL_P(enc_rand_key_zv), &decrypted_key_len);
+    if (!decrypted_key) {
+        if (has_ver) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_DECRYPT,
+                "RSA decryption failed for publickey_ver=%lld (wrong private key for this version, or malformed encrypt_random_key)", (long long)ver);
+        } else {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_DECRYPT,
+                "RSA decryption of encrypt_random_key failed (wrong private key, or malformed encrypt_random_key)");
+        }
+        RETURN_THROWS();
+    }
+
+    /* SDK-decrypt the message */
+    Slice_t *msg = fn_NewSlice();
+    if (!msg) {
+        efree(decrypted_key);
+        zend_throw_exception(zend_ce_exception, "Failed to allocate message buffer", 0);
+        RETURN_THROWS();
+    }
+
+    int ret = fn_DecryptData(decrypted_key, Z_STRVAL_P(enc_msg_zv), msg);
     efree(decrypted_key);
 
     if (ret != 0) {
@@ -530,6 +776,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_wecomarchive_decryptData, 0, 2, 
     ZEND_ARG_TYPE_INFO(0, encryptChatMsg, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_wecomarchive_decryptChatItem, 0, 1, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, chatItem, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_wecomarchive_getMediaData, 0, 1, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO(0, sdkFileId, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "null")
@@ -542,8 +792,9 @@ ZEND_END_ARG_INFO()
 static const zend_function_entry wecomarchive_methods[] = {
     PHP_ME(WeComArchive, __construct,   arginfo_wecomarchive_construct,    ZEND_ACC_PUBLIC)
     PHP_ME(WeComArchive, getChatData,   arginfo_wecomarchive_getChatData,  ZEND_ACC_PUBLIC)
-    PHP_ME(WeComArchive, decryptData,   arginfo_wecomarchive_decryptData,  ZEND_ACC_PUBLIC)
-    PHP_ME(WeComArchive, getMediaData,  arginfo_wecomarchive_getMediaData, ZEND_ACC_PUBLIC)
+    PHP_ME(WeComArchive, decryptData,     arginfo_wecomarchive_decryptData,     ZEND_ACC_PUBLIC)
+    PHP_ME(WeComArchive, decryptChatItem, arginfo_wecomarchive_decryptChatItem, ZEND_ACC_PUBLIC)
+    PHP_ME(WeComArchive, getMediaData,    arginfo_wecomarchive_getMediaData,    ZEND_ACC_PUBLIC)
     PHP_ME(WeComArchive, getSdkVersion, arginfo_wecomarchive_getSdkVersion, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_FE_END
 };

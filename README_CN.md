@@ -226,7 +226,7 @@ public function __construct(array $options)
 - `private_keys`（可选）：多版本私钥映射 `[publickey_ver => PEM 字符串或文件路径]`。`decryptChatItem` 按版本号自动选择
 - `lib_path`（可选）：SDK 库的自定义路径
 
-> 说明：值若以 `-----BEGIN ` 开头视为 PEM 内容，否则视为文件路径。`private_key` 与 `private_keys` 可同时设置，前者作为 `decryptChatItem` 的兜底。
+> 说明：值若为多行内容（PEM 内容总是包含换行，文件路径则不含）或以 `-----BEGIN ` 开头，视为 PEM 内容；否则视为文件路径。这样能兼容带前导元数据的 PEM（例如 `openssl pkcs12` 导出时附带的 `Bag Attributes` 段）。`private_key` 与 `private_keys` 可同时设置，前者作为 `decryptChatItem` 的兜底。
 
 #### getChatData
 

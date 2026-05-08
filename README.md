@@ -232,7 +232,7 @@ public function __construct(array $options)
 - `private_keys` (optional): Multi-version key map `[publickey_ver => PEM-or-path]`. Used by `decryptChatItem()` for auto-selection
 - `lib_path` (optional): Custom path to SDK library
 
-> Detection rule: if a value starts with `-----BEGIN `, it's treated as PEM content; otherwise it's treated as a file path. `private_key` and `private_keys` may both be set — the former acts as a fallback for `decryptChatItem()`.
+> Detection rule: a value is treated as raw PEM content if it spans multiple lines (PEM bodies always contain newlines, file paths do not) or starts with `-----BEGIN `. Single-line values without the PEM header are treated as a file path. This tolerates PEM exports that have leading metadata (e.g. `Bag Attributes` lines from `openssl pkcs12`). `private_key` and `private_keys` may both be set — the former acts as a fallback for `decryptChatItem()`.
 
 #### getChatData
 

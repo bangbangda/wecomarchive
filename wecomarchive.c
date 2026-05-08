@@ -216,10 +216,17 @@ static char *rsa_decrypt(const char *private_key, size_t private_key_len, const 
     return (char *)decrypted;
 }
 
-/* Resolve a private key source: if value starts with "-----BEGIN" treat as PEM content,
-   otherwise treat as a file path and read its contents. Returns a new zend_string (caller
-   owns the reference) or NULL on failure with err_buf populated. */
+/* Resolve a private key source: treat the value as raw PEM content if it is multi-line
+   (PEM bodies always contain newlines, file paths do not) or if it starts with the PEM
+   header marker; otherwise treat it as a file path and read its contents. The multi-line
+   check tolerates leading metadata such as the "Bag Attributes" block emitted by
+   `openssl pkcs12 -out`, matching the old behaviour where the buffer was passed directly
+   to PEM_read_bio_PrivateKey. Returns a new zend_string (caller owns the reference) or
+   NULL on failure with err_buf populated. */
 static zend_string *resolve_private_key_source(const char *src, size_t src_len, char *err_buf, size_t err_buf_size) {
+    if (src_len > 0 && memchr(src, '\n', src_len) != NULL) {
+        return zend_string_init(src, src_len, 0);
+    }
     if (src_len >= 11 && memcmp(src, "-----BEGIN ", 11) == 0) {
         return zend_string_init(src, src_len, 0);
     }

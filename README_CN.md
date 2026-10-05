@@ -10,7 +10,7 @@
 
 - **自动下载 SDK**：安装时自动下载企业微信 SDK
 - **面向对象接口**：简洁、现代的 PHP API 用于会话存档操作
-- **功能完整**：获取消息、解密内容、下载媒体文件
+- **功能完整**：获取消息、解密内容、下载媒体文件（大文件可边下边写入磁盘）
 - **灵活配置**：支持自定义 SDK 路径和代理设置
 
 ## 系统要求
@@ -169,15 +169,34 @@ foreach ($data['chatdata'] as $chat) {
 
 ### 下载媒体文件
 
+用 `saveMediaData()` 把媒体（图片、语音、视频、文件）直接下载到磁盘。它每拿到一个分片（最大 512KB）
+就立即写入文件，不论文件多大，内存占用都基本不变。**视频和文件动辄几百 MB，请务必使用它。**
+
 ```php
 <?php
-// 获取媒体文件（图片、视频、文件等）
+// $msg 是解密后的一条 file 类型消息（video、image、voice 同理）
+$bytes = $archive->saveMediaData($msg['file']['sdkfileid'], '/data/media/' . $msg['msgid'], [
+    'timeout' => 30,                    // 每个分片的超时
+    'md5'     => $msg['file']['md5sum'], // 可选：校验文件完整性
+]);
+```
+
+数据先写到目标旁边的临时文件 `<path>.part-<随机串>`，整个下载（以及 md5 校验）成功后先 `fsync`
+落盘，再原子地 rename 为 `<path>`。任何环节失败都会删除临时文件、保持 `<path>` 原样，并抛出异常。
+以上保证的前提是下载期间目标目录没有被移动或替换。
+
+被替换的文件保留原有的属主、属组、权限和 POSIX ACL；如果无法保留（例如文件属于其他用户），会在写入任何数据之前以
+`WECOM_ERR_WRITE` 失败，原文件保持不变。替换会像 `rename()` 一样产生一个新文件，因此其他扩展属性和硬链接不会保留，
+安全标签（SELinux、AppArmor）按系统策略为该目录下的新文件设置。新建的文件按 umask 和目录的默认 ACL 设置权限，
+与 `file_put_contents()` 一致。
+
+`getMediaData()` 以字符串形式返回整个文件，文件内容会全部留在内存里，适合图片、语音这类小媒体：
+
+```php
+<?php
 $mediaContent = $archive->getMediaData($sdkFileId, [
     'timeout' => 30,
 ]);
-
-// 保存到文件
-file_put_contents('/path/to/output.jpg', $mediaContent);
 ```
 
 ### 使用代理
@@ -283,13 +302,38 @@ public function decryptChatItem(array $chatItem): string
 public function getMediaData(string $sdkFileId, array $options = []): string
 ```
 
-下载媒体文件内容。
+下载媒体文件内容。整个文件会保存在内存中，大文件请使用 `saveMediaData()`。
 
 **参数：**
 - `$sdkFileId`：消息中的 `sdkfileid`
-- `$options`：可选设置（proxy, passwd, timeout）
+- `$options`：可选设置（proxy, passwd, timeout, retries，含义同 `saveMediaData()`，但 `retries` 默认为 0）
 
-**返回：** 媒体文件的二进制内容
+**返回：** 媒体文件的二进制内容（空文件返回 `''`）
+
+#### saveMediaData
+
+```php
+public function saveMediaData(string $sdkFileId, string $path, array $options = []): int
+```
+
+把媒体文件逐个分片直接写入 `$path`。内存占用只取决于分片大小（最大 512KB），与文件大小无关。
+
+**参数：**
+- `$sdkFileId`：消息中的 `sdkfileid`
+- `$path`：要写入的本地文件路径。所在目录必须已存在（不会自动创建）；目标已是普通文件时会被覆盖，并保留原有的属主、属组、权限和 POSIX ACL。只接受本地路径（可带 `file://`），且 `open_basedir` 必须允许目标所在目录（临时文件建在该目录下）
+- `$options`：可选设置
+  - `proxy`、`passwd`：同 `getChatData()`
+  - `timeout`：每个分片的超时秒数（默认 5）
+  - `retries`：某个分片返回 10001～10003 时，按官方建议用相同参数重试的次数（默认 2）
+  - `md5`：文件的预期 MD5，32 位十六进制，例如消息里的 `md5sum`；在写入过程中计算
+
+**返回：** 写入的字节数（空文件返回 0，文件仍会被创建）
+
+**异常：** 抛出 `Exception`，code 为 SDK 原始错误码，或者以下扩展错误码之一：
+`WECOM_ERR_PATH`（目标路径不合法）、`WECOM_ERR_WRITE`（写文件失败）、`WECOM_ERR_MD5`（md5 不一致）、
+`WECOM_ERR_PARAM`（选项不合法）。无论哪种情况，`$path` 都保持原样，也不会残留临时文件。
+如果下载过程中 `max_execution_time` 到期，会在拉取下一个分片前停止并删除临时文件，然后才出现超时致命错误，
+因此通常不会留下残留；如果恰好在拉取最后一个分片时到期，已完整下载的文件仍会先 rename 到位。
 
 #### getSdkVersion
 
@@ -315,6 +359,11 @@ public static function getSdkVersion(): string
 | 10009 | `WECOM_ERR_IP` | IP 不允许 |
 | 10010 | `WECOM_ERR_EXPIRED` | 数据已过期 |
 | 10011 | `WECOM_ERR_CERT` | 证书错误 |
+| 20001 | `WECOM_ERR_WRITE` | 写入目标文件失败（`saveMediaData()`） |
+| 20002 | `WECOM_ERR_MD5` | 下载内容与 `md5` 选项不一致（`saveMediaData()`） |
+| 20003 | `WECOM_ERR_PATH` | 目标路径不合法：非本地路径、超出 `open_basedir`、目录不存在、目标已是目录等非普通文件，或已存在的目标无法读取元数据（`saveMediaData()`） |
+
+100xx 来自企业微信 SDK，原样透传；200xx 由扩展自身抛出。
 
 ## 许可证
 

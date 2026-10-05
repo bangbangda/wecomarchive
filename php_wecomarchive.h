@@ -17,7 +17,7 @@
 extern zend_module_entry wecomarchive_module_entry;
 #define phpext_wecomarchive_ptr &wecomarchive_module_entry
 
-#define PHP_WECOMARCHIVE_VERSION "1.0.0"
+#define PHP_WECOMARCHIVE_VERSION "1.3.0"
 
 #ifdef PHP_WIN32
 # define PHP_WECOMARCHIVE_API __declspec(dllexport)

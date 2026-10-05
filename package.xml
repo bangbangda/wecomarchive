@@ -14,11 +14,11 @@
   <email>hi@qiyuankeji.cn</email>
   <active>yes</active>
  </lead>
- <date>2025-01-05</date>
+ <date>2026-10-05</date>
  <time>09:00:00</time>
  <version>
-  <release>1.0.0</release>
-  <api>1.0.0</api>
+  <release>1.3.0</release>
+  <api>1.3.0</api>
  </version>
  <stability>
   <release>stable</release>
@@ -26,13 +26,10 @@
  </stability>
  <license uri="http://www.php.net/license/3_01.txt">PHP License</license>
  <notes>
-  Initial release:
-  - WeComArchive class with OOP interface
-  - getChatData() - Fetch chat messages
-  - decryptData() - Decrypt message content with RSA private key
-  - getMediaData() - Download media files
-  - Auto-download SDK from official CDN during installation
-  - Support for proxy configuration
+  1.3.0:
+  - saveMediaData() - Stream media files to disk chunk by chunk (atomic rename, retries, md5 check)
+  - New error codes WECOM_ERR_WRITE (20001), WECOM_ERR_MD5 (20002), WECOM_ERR_PATH (20003)
+  - getMediaData(): fix per-chunk memory leak, return '' for empty files, optional "retries"
  </notes>
  <contents>
   <dir name="/">

@@ -21,17 +21,40 @@
 #include "zend_exceptions.h"
 #include "zend_smart_str.h"
 #include "php_streams.h"
+#include "ext/standard/md5.h"
+#include "ext/standard/php_filestat.h"
+#if PHP_VERSION_ID >= 80200
+# include "ext/random/php_random.h"
+#else
+# include "ext/standard/php_random.h"
+#endif
 #include "php_wecomarchive.h"
 
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/xattr.h>
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
 
 /* Error codes (mirrors REGISTER_LONG_CONSTANT in MINIT) */
 #define WECOM_ERR_PARAM   10000
+#define WECOM_ERR_NETWORK 10001
+#define WECOM_ERR_SYSTEM  10003
 #define WECOM_ERR_DECRYPT 10006
 #define WECOM_ERR_PRIKEY  10007
+/* Extension-defined codes, kept outside the SDK's 10000 range */
+#define WECOM_ERR_WRITE   20001
+#define WECOM_ERR_MD5     20002
+#define WECOM_ERR_PATH    20003
+
+#if PHP_VERSION_ID >= 80200
+# define WECOMARCHIVE_TIMED_OUT() zend_atomic_bool_load_ex(&EG(timed_out))
+#else
+# define WECOMARCHIVE_TIMED_OUT() EG(timed_out)
+#endif
 
 ZEND_DECLARE_MODULE_GLOBALS(wecomarchive)
 
@@ -675,14 +698,300 @@ PHP_METHOD(WeComArchive, decryptChatItem)
 }
 /* }}} */
 
+/* Options shared by getMediaData() and saveMediaData() */
+typedef struct {
+    const char *proxy;
+    const char *passwd;
+    zend_long timeout;   /* per-chunk timeout passed to GetMediaData */
+    zend_long retries;   /* per-chunk retries on WECOM_ERR_NETWORK..WECOM_ERR_SYSTEM */
+} media_options;
+
+/* Parse proxy/passwd/timeout/retries from $options. proxy/passwd/timeout keep the lenient
+   handling of the other methods; retries is validated. Returns FAILURE with an exception thrown. */
+static int parse_media_options(zval *options, media_options *opts) {
+    if (!options) {
+        return SUCCESS;
+    }
+
+    HashTable *options_ht = Z_ARRVAL_P(options);
+    zval *tmp;
+
+    tmp = zend_hash_str_find(options_ht, "proxy", sizeof("proxy") - 1);
+    if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
+        opts->proxy = Z_STRVAL_P(tmp);
+    }
+
+    tmp = zend_hash_str_find(options_ht, "passwd", sizeof("passwd") - 1);
+    if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
+        opts->passwd = Z_STRVAL_P(tmp);
+    }
+
+    tmp = zend_hash_str_find(options_ht, "timeout", sizeof("timeout") - 1);
+    if (tmp && Z_TYPE_P(tmp) == IS_LONG) {
+        opts->timeout = Z_LVAL_P(tmp);
+    }
+
+    tmp = zend_hash_str_find(options_ht, "retries", sizeof("retries") - 1);
+    if (tmp && Z_TYPE_P(tmp) != IS_NULL) {
+        if (Z_TYPE_P(tmp) != IS_LONG || Z_LVAL_P(tmp) < 0) {
+            zend_throw_exception(zend_ce_exception, "Option 'retries' must be a non-negative integer", WECOM_ERR_PARAM);
+            return FAILURE;
+        }
+        opts->retries = Z_LVAL_P(tmp);
+    }
+
+    return SUCCESS;
+}
+
+/* Receives one non-empty media chunk. Returns FAILURE with an exception thrown to stop the download. */
+typedef int (*media_chunk_handler)(const char *data, size_t len, void *ctx);
+
+/* Pull a media file chunk by chunk (indexbuf -> outindexbuf until is_finish) and pass every
+   non-empty chunk to handler, so callers decide whether to buffer or stream it. A chunk that
+   fails with WECOM_ERR_NETWORK..WECOM_ERR_SYSTEM is retried with the same indexbuf, as the
+   SDK documentation recommends. Returns FAILURE with an exception thrown. */
+static int fetch_media_chunks(WeWorkFinanceSdk_t *sdk, const char *sdk_file_id, const media_options *opts,
+                              media_chunk_handler handler, void *ctx) {
+    char *indexbuf = NULL;  /* copy of the previous chunk's outindexbuf; NULL for the first chunk */
+    zend_long attempts = 0;
+    int is_finish = 0;
+
+    while (!is_finish) {
+        /* Once max_execution_time has passed, the engine kills the process if we keep running
+           past hard_timeout. Stop here so the caller can still clean up; the fatal error is
+           raised as soon as we return. */
+        if (WECOMARCHIVE_TIMED_OUT()) {
+            zend_throw_exception(zend_ce_exception, "Media download aborted: maximum execution time exceeded", 0);
+            goto fail;
+        }
+
+        MediaData_t *media = fn_NewMediaData();
+        if (!media) {
+            zend_throw_exception(zend_ce_exception, "Failed to allocate media data buffer", 0);
+            goto fail;
+        }
+
+        int ret = fn_GetMediaData(sdk, indexbuf ? indexbuf : "", sdk_file_id, opts->proxy, opts->passwd, (int)opts->timeout, media);
+        if (ret != 0) {
+            fn_FreeMediaData(media);
+            if (ret >= WECOM_ERR_NETWORK && ret <= WECOM_ERR_SYSTEM && attempts < opts->retries) {
+                attempts++;
+                continue;
+            }
+            if (attempts > 0) {
+                zend_throw_exception_ex(zend_ce_exception, ret, "Failed to get media data after %lld retries, error code: %d", (long long)attempts, ret);
+            } else {
+                zend_throw_exception_ex(zend_ce_exception, ret, "Failed to get media data, error code: %d", ret);
+            }
+            goto fail;
+        }
+        attempts = 0;
+
+        if (media->data_len > 0 && handler(media->data, (size_t)media->data_len, ctx) == FAILURE) {
+            fn_FreeMediaData(media);
+            goto fail;
+        }
+
+        is_finish = media->is_finish;
+        if (!is_finish) {
+            if (!media->outindexbuf) {
+                fn_FreeMediaData(media);
+                zend_throw_exception(zend_ce_exception, "SDK returned an unfinished media chunk without outindexbuf", 0);
+                goto fail;
+            }
+            char *next = estrdup(media->outindexbuf);
+            if (indexbuf) {
+                efree(indexbuf);
+            }
+            indexbuf = next;
+        }
+
+        fn_FreeMediaData(media);
+    }
+
+    if (indexbuf) {
+        efree(indexbuf);
+    }
+    return SUCCESS;
+
+fail:
+    if (indexbuf) {
+        efree(indexbuf);
+    }
+    return FAILURE;
+}
+
+static int media_append_to_buffer(const char *data, size_t len, void *ctx) {
+    smart_str_appendl((smart_str *)ctx, data, len);
+    return SUCCESS;
+}
+
+typedef struct {
+    php_stream *stream;
+    const char *path;     /* destination path, for error messages */
+    bool verify_md5;
+    PHP_MD5_CTX md5;
+    zend_long written;
+} media_file_writer;
+
+static int media_write_to_file(const char *data, size_t len, void *ctx) {
+    media_file_writer *writer = (media_file_writer *)ctx;
+
+    errno = 0;
+    ssize_t n = php_stream_write(writer->stream, data, len);
+    if (n < 0 || (size_t)n != len) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to write media data for '%s': %s",
+            writer->path, errno ? strerror(errno) : "short write");
+        return FAILURE;
+    }
+
+    if (writer->verify_md5) {
+        PHP_MD5Update(&writer->md5, data, len);
+    }
+    writer->written += (zend_long)len;
+    return SUCCESS;
+}
+
+/* Check the destination of saveMediaData(): a plain local path (optionally "file://"),
+   allowed by open_basedir, not a directory, inside a directory that already exists.
+   Returns a new string with the directory resolved (symlinks and ".." removed), so that the
+   temporary file, rename and unlink all refer to the same place: ZTS builds resolve paths
+   lexically in VCWD_RENAME/VCWD_UNLINK, while opening a file follows symlinks. Sets
+   *replacing, and *replaced to the stat of the file being replaced if there is one.
+   Returns NULL with a WECOM_ERR_PATH exception thrown. */
+static zend_string *resolve_media_target(zend_string *path, zend_stat_t *replaced, bool *replacing) {
+    const char *local = NULL;
+
+    *replacing = false;
+
+    if (ZSTR_LEN(path) == 0) {
+        zend_throw_exception(zend_ce_exception, "Target path must not be empty", WECOM_ERR_PATH);
+        return NULL;
+    }
+
+    if (php_stream_locate_url_wrapper(ZSTR_VAL(path), &local, 0) != &php_plain_files_wrapper || !local || !*local) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Target path '%s' is not a local file path", ZSTR_VAL(path));
+        return NULL;
+    }
+
+    size_t local_len = strlen(local);
+    const char *slash = zend_memrchr(local, '/', local_len);
+    const char *base = slash ? slash + 1 : local;
+    if (*base == '\0' || strcmp(base, ".") == 0 || strcmp(base, "..") == 0) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Target path '%s' must name a file, not a directory", ZSTR_VAL(path));
+        return NULL;
+    }
+
+    /* Before looking at the file system, so nothing is revealed about paths outside it */
+    if (php_check_open_basedir_ex(local, 0) != 0) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Target path '%s' is not within the allowed path(s) of open_basedir", ZSTR_VAL(path));
+        return NULL;
+    }
+
+    char *dir = estrndup(local, local_len);
+    char resolved_dir[MAXPATHLEN];
+    zend_stat_t st;
+    zend_dirname(dir, local_len);
+    if (!VCWD_REALPATH(dir, resolved_dir) || VCWD_STAT(resolved_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Directory '%s' of target path does not exist", dir);
+        efree(dir);
+        return NULL;
+    }
+    efree(dir);
+
+    size_t dir_len = strlen(resolved_dir);
+    zend_string *target = zend_strpprintf(0, "%s%s%s", resolved_dir,
+        (dir_len > 0 && resolved_dir[dir_len - 1] == '/') ? "" : "/", base);
+
+    if (php_check_open_basedir_ex(ZSTR_VAL(target), 0) != 0) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Target path '%s' is not within the allowed path(s) of open_basedir", ZSTR_VAL(path));
+        zend_string_release(target);
+        return NULL;
+    }
+
+    /* target is absolute, so plain stat() works in ZTS too, and unlike VCWD_STAT it does not
+       report every resolution failure as ENOENT. Only a target that is really missing may be
+       created from scratch: an existing file that cannot be inspected would lose its owner,
+       permissions and ACL. */
+    if (php_sys_stat(ZSTR_VAL(target), &st) != 0) {
+        if (errno != ENOENT) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Cannot inspect target path '%s': %s", ZSTR_VAL(path), strerror(errno));
+            zend_string_release(target);
+            return NULL;
+        }
+    } else {
+        if (S_ISDIR(st.st_mode)) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Target path '%s' is a directory", ZSTR_VAL(path));
+            zend_string_release(target);
+            return NULL;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Target path '%s' exists and is not a regular file", ZSTR_VAL(path));
+            zend_string_release(target);
+            return NULL;
+        }
+        *replaced = st;
+        *replacing = true;
+    }
+
+    return target;
+}
+
+#define WECOM_ACL_XATTR "system.posix_acl_access"
+
+/* Give fd the POSIX access ACL of the file at path, or none if that file has none (the new
+   file may have inherited the directory's default ACL), so that named users and groups of a
+   replaced file neither gain nor lose access. Returns FAILURE with errno set. */
+static int media_copy_access_acl(const char *path, int fd) {
+    ssize_t len = getxattr(path, WECOM_ACL_XATTR, NULL, 0);
+    if (len < 0) {
+        if (errno != ENODATA && errno != ENOTSUP) {
+            return FAILURE;
+        }
+        if (fremovexattr(fd, WECOM_ACL_XATTR) != 0 && errno != ENODATA && errno != ENOTSUP) {
+            return FAILURE;
+        }
+        return SUCCESS;
+    }
+
+    char *acl = emalloc(len > 0 ? (size_t)len : 1);
+    ssize_t got = getxattr(path, WECOM_ACL_XATTR, acl, (size_t)len);
+    int result = FAILURE;
+    if (got != len) {
+        if (got >= 0) {
+            errno = ERANGE;  /* the ACL changed in between */
+        }
+    } else if (fsetxattr(fd, WECOM_ACL_XATTR, acl, (size_t)len, 0) == 0) {
+        result = SUCCESS;
+    }
+    efree(acl);
+    return result;
+}
+
+/* Flush the file to stable storage. Write errors that are only reported asynchronously
+   (EIO, and ENOSPC/EDQUOT on NFS) surface here or at close() rather than at write(). */
+static int media_sync_stream(php_stream *stream) {
+#if PHP_VERSION_ID >= 80100
+    errno = 0;
+    return php_stream_sync(stream, false) == PHP_STREAM_OPTION_RETURN_OK ? SUCCESS : FAILURE;
+#else
+    int fd;
+
+    if (php_stream_cast(stream, PHP_STREAM_AS_FD, (void **)&fd, 0) != SUCCESS) {
+        errno = EBADF;
+        return FAILURE;
+    }
+    return fsync(fd) == 0 ? SUCCESS : FAILURE;
+#endif
+}
+
 /* {{{ proto string WeComArchive::getMediaData(string $sdkFileId, array $options = [])
    Download media file */
 PHP_METHOD(WeComArchive, getMediaData)
 {
     zend_string *sdk_file_id;
     zval *options = NULL;
-    zend_long timeout = 5;
-    char *proxy = "", *passwd = "";
+    media_options opts = { "", "", 5, 0 };  /* no retries unless asked for, as before */
 
     ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_STR(sdk_file_id)
@@ -690,24 +999,8 @@ PHP_METHOD(WeComArchive, getMediaData)
         Z_PARAM_ARRAY(options)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (options) {
-        HashTable *options_ht = Z_ARRVAL_P(options);
-        zval *tmp;
-
-        tmp = zend_hash_str_find(options_ht, "proxy", sizeof("proxy") - 1);
-        if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
-            proxy = Z_STRVAL_P(tmp);
-        }
-
-        tmp = zend_hash_str_find(options_ht, "passwd", sizeof("passwd") - 1);
-        if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
-            passwd = Z_STRVAL_P(tmp);
-        }
-
-        tmp = zend_hash_str_find(options_ht, "timeout", sizeof("timeout") - 1);
-        if (tmp && Z_TYPE_P(tmp) == IS_LONG) {
-            timeout = Z_LVAL_P(tmp);
-        }
+    if (parse_media_options(options, &opts) == FAILURE) {
+        RETURN_THROWS();
     }
 
     wecomarchive_object *intern = Z_WECOMARCHIVE_P(ZEND_THIS);
@@ -719,42 +1012,184 @@ PHP_METHOD(WeComArchive, getMediaData)
 
     /* Collect all media data chunks */
     smart_str buffer = {0};
-    char *indexbuf = "";
-    int is_finish = 0;
+    if (fetch_media_chunks(intern->sdk, ZSTR_VAL(sdk_file_id), &opts, media_append_to_buffer, &buffer) == FAILURE) {
+        smart_str_free(&buffer);
+        RETURN_THROWS();
+    }
 
-    while (!is_finish) {
-        MediaData_t *mediaData = fn_NewMediaData();
-        if (!mediaData) {
-            smart_str_free(&buffer);
-            zend_throw_exception(zend_ce_exception, "Failed to allocate media data buffer", 0);
-            RETURN_THROWS();
-        }
+    /* smart_str_extract() returns "" when nothing was appended (zero-byte file) */
+    RETURN_STR(smart_str_extract(&buffer));
+}
+/* }}} */
 
-        int ret = fn_GetMediaData(intern->sdk, indexbuf, ZSTR_VAL(sdk_file_id), proxy, passwd, (int)timeout, mediaData);
-        if (ret != 0) {
-            fn_FreeMediaData(mediaData);
-            smart_str_free(&buffer);
-            zend_throw_exception_ex(zend_ce_exception, ret, "Failed to get media data, error code: %d", ret);
-            RETURN_THROWS();
-        }
+/* {{{ proto int WeComArchive::saveMediaData(string $sdkFileId, string $path, array $options = [])
+   Download media file straight to disk, one chunk at a time */
+PHP_METHOD(WeComArchive, saveMediaData)
+{
+    zend_string *sdk_file_id, *path;
+    zval *options = NULL;
+    zend_string *expected_md5 = NULL;
+    media_options opts = { "", "", 5, 2 };
 
-        /* Append data to buffer */
-        smart_str_appendl(&buffer, mediaData->data, mediaData->data_len);
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STR(sdk_file_id)
+        Z_PARAM_PATH_STR(path)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY(options)
+    ZEND_PARSE_PARAMETERS_END();
 
-        is_finish = mediaData->is_finish;
-        if (!is_finish) {
-            indexbuf = estrdup(mediaData->outindexbuf);
-        }
+    if (parse_media_options(options, &opts) == FAILURE) {
+        RETURN_THROWS();
+    }
 
-        fn_FreeMediaData(mediaData);
-
-        if (!is_finish && indexbuf) {
-            /* indexbuf was duplicated, will be freed after next iteration */
+    if (options) {
+        zval *tmp = zend_hash_str_find(Z_ARRVAL_P(options), "md5", sizeof("md5") - 1);
+        if (tmp && Z_TYPE_P(tmp) != IS_NULL) {
+            if (Z_TYPE_P(tmp) != IS_STRING || Z_STRLEN_P(tmp) != 32
+                || strspn(Z_STRVAL_P(tmp), "0123456789abcdefABCDEF") != 32) {
+                zend_throw_exception(zend_ce_exception, "Option 'md5' must be a 32-character hexadecimal string", WECOM_ERR_PARAM);
+                RETURN_THROWS();
+            }
+            expected_md5 = Z_STR_P(tmp);
         }
     }
 
-    smart_str_0(&buffer);
-    RETVAL_STR(buffer.s);
+    wecomarchive_object *intern = Z_WECOMARCHIVE_P(ZEND_THIS);
+
+    if (!intern->sdk) {
+        zend_throw_exception(zend_ce_exception, "SDK not initialized", 0);
+        RETURN_THROWS();
+    }
+
+    zend_stat_t replaced = {0};
+    bool replacing;
+    zend_string *target = resolve_media_target(path, &replaced, &replacing);
+    if (!target) {
+        RETURN_THROWS();
+    }
+
+    /* Write to a uniquely named sibling first, then rename it over the target, so the
+       target is either left untouched or replaced by a complete file. */
+    unsigned char rand_bytes[8];
+    char rand_hex[2 * sizeof(rand_bytes) + 1];
+    if (php_random_bytes_throw(rand_bytes, sizeof(rand_bytes)) == FAILURE) {
+        zend_string_release(target);
+        RETURN_THROWS();
+    }
+    make_digest_ex(rand_hex, rand_bytes, sizeof(rand_bytes));
+    zend_string *tmp_path = zend_strpprintf(0, "%s.part-%s", ZSTR_VAL(target), rand_hex);
+
+    /* The checks on the target follow a final symlink, while the temporary file (and so the entry
+       the rename replaces) lives in the target's own directory: it must be allowed by itself.
+       Opening below bypasses the stream wrapper that would otherwise check it. */
+    if (php_check_open_basedir_ex(ZSTR_VAL(tmp_path), 0) != 0) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "Directory of target path '%s' is not within the allowed path(s) of open_basedir",
+            ZSTR_VAL(path));
+        zend_string_release(tmp_path);
+        zend_string_release(target);
+        RETURN_THROWS();
+    }
+
+    /* O_EXCL refuses to reuse an existing file. While a file is being replaced, the temporary
+       file is only accessible to its owner until the replaced file's owner, group and permissions
+       are restored below; a new file gets 0666 minus the umask, as with file_put_contents().
+       The data itself is written through a PHP stream. */
+    int open_flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+    open_flags |= O_CLOEXEC;
+#endif
+    int fd = VCWD_OPEN_MODE(ZSTR_VAL(tmp_path), open_flags, replacing ? (replaced.st_mode & 0700) : 0666);
+    if (fd < 0) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to create temporary file '%s': %s",
+            ZSTR_VAL(tmp_path), strerror(errno));
+        zend_string_release(tmp_path);
+        zend_string_release(target);
+        RETURN_THROWS();
+    }
+
+    php_stream *stream = php_stream_fopen_from_fd(fd, "wb", NULL);
+    if (!stream) {
+        close(fd);
+        VCWD_UNLINK(ZSTR_VAL(tmp_path));
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to open temporary file '%s'", ZSTR_VAL(tmp_path));
+        zend_string_release(tmp_path);
+        zend_string_release(target);
+        RETURN_THROWS();
+    }
+    /* Write errors are reported through the exception, not as notices */
+    stream->flags |= PHP_STREAM_FLAG_SUPPRESS_ERRORS;
+
+    media_file_writer writer = { .stream = stream, .path = ZSTR_VAL(path), .verify_md5 = expected_md5 != NULL };
+    if (writer.verify_md5) {
+        PHP_MD5Init(&writer.md5);
+    }
+
+    int result = SUCCESS;
+
+    /* Before any data is written, give the new file the replaced file's owner, group, access
+       ACL and permissions, or give up: otherwise the permission bits could let other users
+       read it (the process's own group, or an ACL that narrowed access). Until then the mode
+       given to open() keeps it private, which also zeroes the mask of an inherited ACL.
+       The stream owns fd from here on. */
+    if (replacing && (fchown(fd, replaced.st_uid, replaced.st_gid) != 0
+            || media_copy_access_acl(ZSTR_VAL(target), fd) == FAILURE
+            || fchmod(fd, replaced.st_mode & 0777) != 0)) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to keep the owner, group and permissions of '%s': %s",
+            ZSTR_VAL(path), strerror(errno));
+        result = FAILURE;
+    }
+
+    if (result == SUCCESS) {
+        result = fetch_media_chunks(intern->sdk, ZSTR_VAL(sdk_file_id), &opts, media_write_to_file, &writer);
+    }
+
+    if (result == SUCCESS && media_sync_stream(stream) == FAILURE) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to flush media data for '%s': %s",
+            ZSTR_VAL(path), errno ? strerror(errno) : "unknown error");
+        result = FAILURE;
+    }
+
+    errno = 0;
+    if (php_stream_close(stream) != 0 && result == SUCCESS) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to close media file for '%s': %s",
+            ZSTR_VAL(path), errno ? strerror(errno) : "unknown error");
+        result = FAILURE;
+    }
+
+    if (result == SUCCESS && writer.verify_md5) {
+        unsigned char digest[16];
+        char actual[33];
+        PHP_MD5Final(digest, &writer.md5);
+        make_digest_ex(actual, digest, sizeof(digest));
+        if (strncasecmp(actual, ZSTR_VAL(expected_md5), 32) != 0) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_MD5, "MD5 mismatch for '%s': expected %s, got %s",
+                ZSTR_VAL(path), ZSTR_VAL(expected_md5), actual);
+            result = FAILURE;
+        }
+    }
+
+    if (result == SUCCESS) {
+        if (VCWD_RENAME(ZSTR_VAL(tmp_path), ZSTR_VAL(target)) != 0) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to move temporary file to '%s': %s",
+                ZSTR_VAL(path), strerror(errno));
+            result = FAILURE;
+        } else {
+            /* As rename() does: cached stat results and realpaths (e.g. of a symlink that was
+               just replaced) would otherwise still describe the old file */
+            php_clear_stat_cache(1, NULL, 0);
+        }
+    }
+
+    if (result == FAILURE) {
+        VCWD_UNLINK(ZSTR_VAL(tmp_path));
+    }
+
+    zend_string_release(tmp_path);
+    zend_string_release(target);
+    if (result == FAILURE) {
+        RETURN_THROWS();
+    }
+    RETURN_LONG(writer.written);
 }
 /* }}} */
 
@@ -792,6 +1227,12 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_wecomarchive_getMediaData, 0, 1,
     ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 1, "null")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_wecomarchive_saveMediaData, 0, 2, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, sdkFileId, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_wecomarchive_getSdkVersion, 0, 0, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
@@ -802,6 +1243,7 @@ static const zend_function_entry wecomarchive_methods[] = {
     PHP_ME(WeComArchive, decryptData,     arginfo_wecomarchive_decryptData,     ZEND_ACC_PUBLIC)
     PHP_ME(WeComArchive, decryptChatItem, arginfo_wecomarchive_decryptChatItem, ZEND_ACC_PUBLIC)
     PHP_ME(WeComArchive, getMediaData,    arginfo_wecomarchive_getMediaData,    ZEND_ACC_PUBLIC)
+    PHP_ME(WeComArchive, saveMediaData,   arginfo_wecomarchive_saveMediaData,   ZEND_ACC_PUBLIC)
     PHP_ME(WeComArchive, getSdkVersion, arginfo_wecomarchive_getSdkVersion, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_FE_END
 };
@@ -834,6 +1276,9 @@ PHP_MINIT_FUNCTION(wecomarchive)
     REGISTER_LONG_CONSTANT("WECOM_ERR_IP", 10009, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("WECOM_ERR_EXPIRED", 10010, CONST_CS | CONST_PERSISTENT);
     REGISTER_LONG_CONSTANT("WECOM_ERR_CERT", 10011, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("WECOM_ERR_WRITE", WECOM_ERR_WRITE, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("WECOM_ERR_MD5", WECOM_ERR_MD5, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("WECOM_ERR_PATH", WECOM_ERR_PATH, CONST_CS | CONST_PERSISTENT);
 
     return SUCCESS;
 }

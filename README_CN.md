@@ -10,7 +10,7 @@
 
 - **自动下载 SDK**：安装时自动下载企业微信 SDK
 - **面向对象接口**：简洁、现代的 PHP API 用于会话存档操作
-- **功能完整**：获取消息、解密内容、下载媒体文件（大文件可边下边写入磁盘）
+- **功能完整**：获取消息、解密内容、下载媒体文件（边下边写入磁盘，支持墙钟时长上限和断点续传）
 - **灵活配置**：支持自定义 SDK 路径和代理设置
 
 ## 系统要求
@@ -176,10 +176,14 @@ foreach ($data['chatdata'] as $chat) {
 <?php
 // $msg 是解密后的一条 file 类型消息（video、image、voice 同理）
 $bytes = $archive->saveMediaData($msg['file']['sdkfileid'], '/data/media/' . $msg['msgid'], [
-    'timeout' => 30,                    // 每个分片的超时
-    'md5'     => $msg['file']['md5sum'], // 可选：校验文件完整性
+    'timeout'     => 30,                    // 每个分片的超时
+    'max_seconds' => 600,                   // 可选：整个下载最多用 10 分钟（墙钟时间）
+    'md5'         => $msg['file']['md5sum'], // 可选：校验文件完整性
 ]);
 ```
+
+`max_seconds` 按单调墙钟计时，等待网络的时间也算在内（Linux 上 `max_execution_time` 按 CPU 时间计，
+等网络时不走）。时间用完时会在拉取下一个分片前停止，删除临时文件并抛出 `WECOM_ERR_TIMEOUT`。
 
 数据先写到目标旁边的临时文件 `<path>.part-<随机串>`，整个下载（以及 md5 校验）成功后先 `fsync`
 落盘，再原子地 rename 为 `<path>`。任何环节失败都会删除临时文件、保持 `<path>` 原样，并抛出异常。
@@ -189,6 +193,38 @@ $bytes = $archive->saveMediaData($msg['file']['sdkfileid'], '/data/media/' . $ms
 `WECOM_ERR_WRITE` 失败，原文件保持不变。替换会像 `rename()` 一样产生一个新文件，因此其他扩展属性和硬链接不会保留，
 安全标签（SELinux、AppArmor）按系统策略为该目录下的新文件设置。新建的文件按 umask 和目录的默认 ACL 设置权限，
 与 `file_put_contents()` 一致。
+
+### 断点续传
+
+一个任务的时间预算内下不完的文件，可以用 `saveMediaDataPart()` 分多次下载，各次调用可以在不同进程里、
+相隔几天（企业微信保留媒体文件 5 天）。每次调用最多用 `max_seconds` 往 `$partPath` 追加数据，然后把文件
+落盘并返回停在哪里。调用方记下 `indexbuf` 和 `bytes`，下次以 `indexbuf` 和 `offset` 传回：
+
+```php
+<?php
+$part = '/data/media/' . $msg['msgid'] . '.part';
+$state = ['indexbuf' => '', 'offset' => 0];   // 来自你的任务存储；首次为空
+
+$result = $archive->saveMediaDataPart($msg['file']['sdkfileid'], $part, $state + [
+    'max_seconds' => 600,
+    'timeout'     => 30,
+    'md5'         => $msg['file']['md5sum'],   // 下载完成时校验
+]);
+
+if ($result['finished']) {
+    rename($part, '/data/media/' . $msg['msgid']);  // 文件已完整且已 fsync
+} else {
+    // 保存 ['indexbuf' => $result['indexbuf'], 'offset' => $result['bytes']]，稍后再调用
+}
+```
+
+`offset` 是调用方确认已写入文件的字节数；超出它的部分（某次调用写入了但结果没来得及记录，例如进程被杀）
+会在继续下载前被截掉。`max_seconds` 用完不算错误，返回 `finished => false`。只有真正出错才抛异常，
+而且出错时不会动 `$partPath`，调用方可以从上次记录的状态继续。方法不会 rename 文件，下载完成后放到哪里由调用方决定。
+
+续传令牌就是 SDK 自己的 `outindexbuf`。SDK v3_20250205 的令牌是文本 `Range:bytes=<start>-<end>`，
+即下一片的 HTTP 字节范围，不含任何会话状态，所以跨进程、跨时间都有效。扩展会检查 `<start>` 是否等于
+`offset`，不一致时以 `WECOM_ERR_RESUME` 拒绝；其他形式的令牌原样传给 SDK。
 
 `getMediaData()` 以字符串形式返回整个文件，文件内容会全部留在内存里，适合图片、语音这类小媒体：
 
@@ -258,7 +294,7 @@ public function getChatData(int $seq = 0, int $limit = 100, array $options = [])
 **参数：**
 - `$seq`：起始序列号（首次获取使用 0）
 - `$limit`：最大获取消息数（1-1000）
-- `$options`：可选设置（proxy, passwd, timeout）
+- `$options`：可选设置（proxy, passwd, timeout——正数秒，可以是 int、float 或数字字符串，其他值抛 `WECOM_ERR_PARAM`）
 
 **返回：** 包含聊天数据的 JSON 字符串
 
@@ -306,7 +342,7 @@ public function getMediaData(string $sdkFileId, array $options = []): string
 
 **参数：**
 - `$sdkFileId`：消息中的 `sdkfileid`
-- `$options`：可选设置（proxy, passwd, timeout, retries，含义同 `saveMediaData()`，但 `retries` 默认为 0）
+- `$options`：可选设置（proxy, passwd, timeout, retries, max_seconds，含义同 `saveMediaData()`，但 `retries` 默认为 0）
 
 **返回：** 媒体文件的二进制内容（空文件返回 `''`）
 
@@ -323,17 +359,47 @@ public function saveMediaData(string $sdkFileId, string $path, array $options = 
 - `$path`：要写入的本地文件路径。所在目录必须已存在（不会自动创建）；目标已是普通文件时会被覆盖，并保留原有的属主、属组、权限和 POSIX ACL。只接受本地路径（可带 `file://`），且 `open_basedir` 必须允许目标所在目录（临时文件建在该目录下）
 - `$options`：可选设置
   - `proxy`、`passwd`：同 `getChatData()`
-  - `timeout`：每个分片的超时秒数（默认 5）
-  - `retries`：某个分片返回 10001～10003 时，按官方建议用相同参数重试的次数（默认 2）
+  - `timeout`：每个分片的超时秒数（默认 5）。正数的 int、float 或数字字符串，小数向上取整；其他值抛 `WECOM_ERR_PARAM`
+  - `retries`：某个分片返回 10001～10003 时，按官方建议用相同参数重试的次数（默认 2）。每次重试前等待 200ms × 重试次数，且不超过 `max_seconds` 的剩余时间
+  - `max_seconds`：整次调用的墙钟时长上限，大于 0 的 int 或 float（默认不限）。每次请求分片（含重试）前检查；单片 `timeout` 会被压到剩余时间以内（至少 1 秒）。用完时抛 `WECOM_ERR_TIMEOUT`
   - `md5`：文件的预期 MD5，32 位十六进制，例如消息里的 `md5sum`；在写入过程中计算
 
 **返回：** 写入的字节数（空文件返回 0，文件仍会被创建）
 
 **异常：** 抛出 `Exception`，code 为 SDK 原始错误码，或者以下扩展错误码之一：
 `WECOM_ERR_PATH`（目标路径不合法）、`WECOM_ERR_WRITE`（写文件失败）、`WECOM_ERR_MD5`（md5 不一致）、
-`WECOM_ERR_PARAM`（选项不合法）。无论哪种情况，`$path` 都保持原样，也不会残留临时文件。
+`WECOM_ERR_TIMEOUT`（`max_seconds` 用完）、`WECOM_ERR_INDEXBUF`（SDK 响应无法继续）、
+`WECOM_ERR_EXEC_TIME`（`max_execution_time` 到期）、`WECOM_ERR_PARAM`（选项不合法）。无论哪种情况，`$path` 都保持原样，
+也不会残留临时文件。rename 成功后还会对所在目录做一次 fsync。
 如果下载过程中 `max_execution_time` 到期，会在拉取下一个分片前停止并删除临时文件，然后才出现超时致命错误，
 因此通常不会留下残留；如果恰好在拉取最后一个分片时到期，已完整下载的文件仍会先 rename 到位。
+
+#### saveMediaDataPart
+
+```php
+public function saveMediaDataPart(string $sdkFileId, string $partPath, array $options = []): array
+```
+
+分段、可续传地下载媒体文件：最多用 `max_seconds` 往 `$partPath` 追加数据，然后把文件落盘并报告停在哪里。
+见[断点续传](#断点续传)。
+
+**参数：**
+- `$sdkFileId`：消息中的 `sdkfileid`
+- `$partPath`：接收数据的本地文件，路径规则同 `saveMediaData()`。`offset` 为 0 时创建或清空；否则必须已存在且不小于 `offset` 字节，继续下载前会先截断到 `offset`
+- `$options`：可选设置
+  - `indexbuf`：上次调用返回的 `indexbuf`（默认 `''`，从文件开头下载）。`offset` 大于 0 时必填
+  - `offset`：此前各次调用已写入 `$partPath` 的字节数（默认 0）
+  - `max_seconds`、`timeout`、`retries`、`proxy`、`passwd`：同 `saveMediaData()`
+  - `md5`：预期 MD5；下载完成时以流式读取文件校验
+
+**返回：** `['finished' => bool, 'indexbuf' => string, 'bytes' => int]`。`finished` 为 true 表示最后一片已写入；
+`indexbuf` 是下次调用的令牌（完成时为 `''`）；`bytes` 是 `$partPath` 当前的大小。`max_seconds` 用完返回
+`finished => false`，不算错误。每次返回前都会 `fsync` 文件。
+
+**异常：** 抛出 `Exception`，code 为 SDK 原始错误码，或 `WECOM_ERR_PATH`、`WECOM_ERR_WRITE`、
+`WECOM_ERR_MD5`（完成的文件与 `md5` 不一致）、`WECOM_ERR_RESUME`（`$partPath` 不存在或小于 `offset`，或 `indexbuf`
+对应另一个偏移）、`WECOM_ERR_INDEXBUF`、`WECOM_ERR_EXEC_TIME`、`WECOM_ERR_PARAM`。抛异常时绝不会删除 `$partPath`：
+它保存着调用方已知的字节（可能还多一些），调用方可以从上次记录的状态继续。
 
 #### getSdkVersion
 
@@ -361,7 +427,12 @@ public static function getSdkVersion(): string
 | 10011 | `WECOM_ERR_CERT` | 证书错误 |
 | 20001 | `WECOM_ERR_WRITE` | 写入目标文件失败（`saveMediaData()`） |
 | 20002 | `WECOM_ERR_MD5` | 下载内容与 `md5` 选项不一致（`saveMediaData()`） |
-| 20003 | `WECOM_ERR_PATH` | 目标路径不合法：非本地路径、超出 `open_basedir`、目录不存在、目标已是目录等非普通文件，或已存在的目标无法读取元数据（`saveMediaData()`） |
+| 20003 | `WECOM_ERR_PATH` | 目标路径不合法：非本地路径、超出 `open_basedir`、目录不存在、目标已是目录等非普通文件，或已存在的目标无法读取元数据（`saveMediaData()`、`saveMediaDataPart()`） |
+| 20004 | `WECOM_ERR_TIMEOUT` | `max_seconds` 用完时下载还没结束（`getMediaData()`、`saveMediaData()`） |
+| 20005 | `WECOM_ERR_EXEC_TIME` | 下载期间 `max_execution_time` 到期，随后出现引擎的致命错误（`getMediaData()`、`saveMediaData()`、`saveMediaDataPart()`） |
+| 20006 | `WECOM_ERR_INDEXBUF` | SDK 返回了未完成的分片却没有新的 `outindexbuf`，无法继续（`getMediaData()`、`saveMediaData()`、`saveMediaDataPart()`） |
+| 20007 | `WECOM_ERR_NOT_INIT` | 对象没有 SDK 实例，例如绕过构造函数创建（所有调用 SDK 的方法） |
+| 20008 | `WECOM_ERR_RESUME` | 无法续传：`$partPath` 不存在或小于 `offset`，或 `indexbuf` 对应另一个偏移（`saveMediaDataPart()`） |
 
 100xx 来自企业微信 SDK，原样透传；200xx 由扩展自身抛出。
 

@@ -43,3 +43,12 @@ run-tests.php
 
 # SDK library (downloaded separately)
 libWeWorkFinanceSdk_C.so
+
+# phpt test artifacts (run-tests.php)
+tests/phpt/*.diff
+tests/phpt/*.exp
+tests/phpt/*.log
+tests/phpt/*.out
+tests/phpt/*.php
+tests/phpt/*.sh
+tests/phpt/*.mem

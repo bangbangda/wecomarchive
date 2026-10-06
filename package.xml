@@ -14,11 +14,11 @@
   <email>hi@qiyuankeji.cn</email>
   <active>yes</active>
  </lead>
- <date>2026-10-05</date>
+ <date>2026-10-06</date>
  <time>09:00:00</time>
  <version>
-  <release>1.3.0</release>
-  <api>1.3.0</api>
+  <release>1.4.0</release>
+  <api>1.4.0</api>
  </version>
  <stability>
   <release>stable</release>
@@ -26,6 +26,12 @@
  </stability>
  <license uri="http://www.php.net/license/3_01.txt">PHP License</license>
  <notes>
+  1.4.0:
+  - saveMediaData()/getMediaData(): "max_seconds" wall-clock limit (WECOM_ERR_TIMEOUT, 20004)
+  - New saveMediaDataPart(): resumable downloads across calls and processes (indexbuf/offset)
+  - Retries of 10001-10003 back off 200 ms x attempt; the directory is fsync'ed after rename
+  - "timeout" accepts int/float/numeric string and rejects anything else with WECOM_ERR_PARAM
+  - New error codes WECOM_ERR_EXEC_TIME (20005), WECOM_ERR_INDEXBUF (20006), WECOM_ERR_NOT_INIT (20007), WECOM_ERR_RESUME (20008)
   1.3.0:
   - saveMediaData() - Stream media files to disk chunk by chunk (atomic rename, retries, md5 check)
   - New error codes WECOM_ERR_WRITE (20001), WECOM_ERR_MD5 (20002), WECOM_ERR_PATH (20003)
@@ -38,6 +44,7 @@
    <file name="wecomarchive.c" role="src" />
    <file name="LICENSE" role="doc" />
    <file name="README.md" role="doc" />
+   <file name="CHANGELOG.md" role="doc" />
    <dir name="scripts">
     <file name="download-sdk.sh" role="script" />
    </dir>

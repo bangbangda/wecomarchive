@@ -12,7 +12,7 @@ PHP extension for WeCom (WeChat Work) Chat Archive functionality.
 
 - **Automatic SDK Download**: WeCom SDK is automatically downloaded during installation
 - **Object-Oriented Interface**: Clean, modern PHP API for chat archive operations
-- **Full Functionality**: Fetch messages, decrypt content, download media files (streamed to disk for large files)
+- **Full Functionality**: Fetch messages, decrypt content, download media files (streamed to disk, with a wall-clock time limit and resumable downloads for large files)
 - **Flexible Configuration**: Support for custom SDK paths and proxy settings
 
 ## Requirements
@@ -183,10 +183,15 @@ is. **Use it for videos and files, which can be hundreds of MB.**
 <?php
 // $msg is a decrypted message of type "file" (video, image and voice look alike)
 $bytes = $archive->saveMediaData($msg['file']['sdkfileid'], '/data/media/' . $msg['msgid'], [
-    'timeout' => 30,                    // per chunk
-    'md5'     => $msg['file']['md5sum'], // optional integrity check
+    'timeout'     => 30,                    // per chunk
+    'max_seconds' => 600,                   // optional: give up after 10 minutes of wall-clock time
+    'md5'         => $msg['file']['md5sum'], // optional integrity check
 ]);
 ```
+
+`max_seconds` is measured on a monotonic wall clock, so it also covers time spent waiting for the network
+(`max_execution_time` counts CPU time on Linux and does not). When it runs out, the download stops before the
+next chunk, the temporary file is removed and `WECOM_ERR_TIMEOUT` is thrown.
 
 The data goes to a temporary `<path>.part-<random>` file next to the target, which is flushed to disk
 (`fsync`) and renamed onto `<path>` only after the whole download (and the md5 check) succeeded. On any
@@ -199,6 +204,42 @@ written and the file is left untouched. Replacing creates a new file, as `rename
 extended attributes and hard links are not carried over, and security labels (SELinux, AppArmor) follow
 the system policy for new files in that directory. A new file is created according to the umask and the
 directory's default ACL, as with `file_put_contents()`.
+
+### Resumable Downloads
+
+A file that cannot be downloaded within one job's time budget can be fetched in several calls of
+`saveMediaDataPart()`, possibly from different processes, days apart (the SDK keeps a media file for 5 days).
+Each call appends to `$partPath` for at most `max_seconds`, flushes the file to disk and returns where it
+stopped. The caller records `indexbuf` and `bytes` and passes them back as `indexbuf` and `offset`:
+
+```php
+<?php
+$part = '/data/media/' . $msg['msgid'] . '.part';
+$state = ['indexbuf' => '', 'offset' => 0];   // from your job store; empty for the first call
+
+$result = $archive->saveMediaDataPart($msg['file']['sdkfileid'], $part, $state + [
+    'max_seconds' => 600,
+    'timeout'     => 30,
+    'md5'         => $msg['file']['md5sum'],   // checked once the download is finished
+]);
+
+if ($result['finished']) {
+    rename($part, '/data/media/' . $msg['msgid']);  // the file is complete and fsync'ed
+} else {
+    // save ['indexbuf' => $result['indexbuf'], 'offset' => $result['bytes']] and call again later
+}
+```
+
+`offset` is the number of bytes the caller knows to be in the file; whatever lies beyond it (written by a
+call whose result was never recorded, e.g. because the process was killed) is cut off before the download
+continues. Running out of `max_seconds` is not an error: the call returns `finished => false`. Exceptions
+are thrown only for real failures, and then `$partPath` is left as it is, so the caller can resume from its
+last recorded state. The method never renames the file: the caller decides where the finished file goes.
+
+The resume token is the SDK's own `outindexbuf`. For SDK v3_20250205 it is the text
+`Range:bytes=<start>-<end>`, i.e. the HTTP byte range of the next chunk, which carries no session state and
+is therefore valid across processes and over time. The extension checks that `<start>` equals `offset` and
+refuses a mismatching pair with `WECOM_ERR_RESUME`; a token in any other form is passed to the SDK unchanged.
 
 `getMediaData()` returns the whole file as a string, so it holds the entire file in memory. It is
 fine for small media such as images and voice messages:
@@ -269,7 +310,7 @@ Fetch chat messages.
 **Parameters:**
 - `$seq`: Starting sequence number (0 for first fetch)
 - `$limit`: Maximum messages to fetch (1-1000)
-- `$options`: Optional settings (proxy, passwd, timeout)
+- `$options`: Optional settings (proxy, passwd, timeout — a positive number of seconds as int, float or numeric string; anything else throws `WECOM_ERR_PARAM`)
 
 **Returns:** JSON string with chat data
 
@@ -317,7 +358,7 @@ Download media file content. The whole file is held in memory; use `saveMediaDat
 
 **Parameters:**
 - `$sdkFileId`: The `sdkfileid` from message
-- `$options`: Optional settings (proxy, passwd, timeout, retries — same meaning as for `saveMediaData()`, but `retries` defaults to 0)
+- `$options`: Optional settings (proxy, passwd, timeout, retries, max_seconds — same meaning as for `saveMediaData()`, but `retries` defaults to 0)
 
 **Returns:** Binary content of the media file (`''` for an empty file)
 
@@ -335,19 +376,51 @@ chunk size (at most 512 KB), not on the file size.
 - `$path`: Local file path to write. The directory must already exist (it is not created); an existing regular file is replaced and keeps its owner, group, permissions and POSIX ACL. Only local paths (optionally `file://`) are accepted, and `open_basedir` must allow the target's directory, where the temporary file is created
 - `$options`: Optional settings
   - `proxy`, `passwd`: same as `getChatData()`
-  - `timeout`: timeout in seconds for each chunk (default 5)
-  - `retries`: how many times a chunk that fails with 10001–10003 is retried with the same arguments, as the SDK documentation recommends (default 2)
+  - `timeout`: timeout in seconds for each chunk (default 5). A positive int, float or numeric string; fractions are rounded up, anything else throws `WECOM_ERR_PARAM`
+  - `retries`: how many times a chunk that fails with 10001–10003 is retried with the same arguments, as the SDK documentation recommends (default 2). Retries wait 200 ms × the retry number, never longer than the remaining `max_seconds`
+  - `max_seconds`: wall-clock limit for the whole call as a positive int or float (default: none). Checked before every chunk request, including retries; the per-chunk `timeout` is cut down to the remaining time (at least 1 s). When it runs out, `WECOM_ERR_TIMEOUT` is thrown
   - `md5`: expected MD5 of the file as 32 hex characters, e.g. the message's `md5sum`; computed while writing
 
 **Returns:** Number of bytes written (0 for an empty file, which is still created)
 
 **Throws:** an `Exception` whose code is either the SDK error code, or one of
 `WECOM_ERR_PATH` (invalid target path), `WECOM_ERR_WRITE` (the file cannot be written),
-`WECOM_ERR_MD5` (checksum mismatch) or `WECOM_ERR_PARAM` (invalid option). In every case `$path` is
-left as it was and no temporary file remains. If `max_execution_time` runs out during a download, the
+`WECOM_ERR_MD5` (checksum mismatch), `WECOM_ERR_TIMEOUT` (`max_seconds` ran out), `WECOM_ERR_INDEXBUF`
+(unusable SDK response), `WECOM_ERR_EXEC_TIME` (`max_execution_time` ran out) or `WECOM_ERR_PARAM`
+(invalid option). In every case `$path` is left as it was and no temporary file remains. After a successful
+rename the directory is fsync'ed as well. If `max_execution_time` runs out during a download, the
 download stops before the next chunk and removes the temporary file before the fatal error, so normally
 nothing is left behind; if it runs out while the last chunk is being fetched, the complete file is still
 moved into place first.
+
+#### saveMediaDataPart
+
+```php
+public function saveMediaDataPart(string $sdkFileId, string $partPath, array $options = []): array
+```
+
+Download a media file in resumable pieces: append to `$partPath` for at most `max_seconds`, then flush the
+file to disk and report where the download stopped. See [Resumable Downloads](#resumable-downloads).
+
+**Parameters:**
+- `$sdkFileId`: The `sdkfileid` from message
+- `$partPath`: Local file that receives the data, with the same path rules as `saveMediaData()`. With `offset` 0 it is created or emptied; otherwise it must exist and be at least `offset` bytes long, and is truncated to `offset` before the download continues
+- `$options`: Optional settings
+  - `indexbuf`: the `indexbuf` returned by the previous call (default `''`, the start of the file). Required when `offset` > 0
+  - `offset`: number of bytes already in `$partPath` from previous calls (default 0)
+  - `max_seconds`, `timeout`, `retries`, `proxy`, `passwd`: as for `saveMediaData()`
+  - `md5`: expected MD5; checked by reading the file back once the download is finished
+
+**Returns:** `['finished' => bool, 'indexbuf' => string, 'bytes' => int]`. `finished` is true once the last
+chunk was written; `indexbuf` is the token for the next call (`''` when finished); `bytes` is the size of
+`$partPath` now. Running out of `max_seconds` returns `finished => false`; it is not an error. The file is
+flushed with `fsync()` before every return.
+
+**Throws:** an `Exception` whose code is either the SDK error code, or `WECOM_ERR_PATH`, `WECOM_ERR_WRITE`,
+`WECOM_ERR_MD5` (the finished file does not match `md5`), `WECOM_ERR_RESUME` (`$partPath` is missing or
+shorter than `offset`, or `indexbuf` belongs to a different offset), `WECOM_ERR_INDEXBUF`,
+`WECOM_ERR_EXEC_TIME` or `WECOM_ERR_PARAM`. On an exception `$partPath` is never deleted: it holds the
+bytes known to the caller (and possibly more), so the caller can resume from its last recorded state.
 
 #### getSdkVersion
 
@@ -375,7 +448,12 @@ Get the SDK version.
 | 10011 | `WECOM_ERR_CERT` | Certificate error |
 | 20001 | `WECOM_ERR_WRITE` | Failed to write the target file (`saveMediaData()`) |
 | 20002 | `WECOM_ERR_MD5` | Downloaded file does not match the `md5` option (`saveMediaData()`) |
-| 20003 | `WECOM_ERR_PATH` | Invalid target path: not local, outside `open_basedir`, directory missing, an existing directory or other non-regular file, or an existing target that cannot be inspected (`saveMediaData()`) |
+| 20003 | `WECOM_ERR_PATH` | Invalid target path: not local, outside `open_basedir`, directory missing, an existing directory or other non-regular file, or an existing target that cannot be inspected (`saveMediaData()`, `saveMediaDataPart()`) |
+| 20004 | `WECOM_ERR_TIMEOUT` | The `max_seconds` option ran out before the download finished (`getMediaData()`, `saveMediaData()`) |
+| 20005 | `WECOM_ERR_EXEC_TIME` | `max_execution_time` ran out during a download; the engine's fatal error follows (`getMediaData()`, `saveMediaData()`, `saveMediaDataPart()`) |
+| 20006 | `WECOM_ERR_INDEXBUF` | The SDK returned an unfinished chunk without a new `outindexbuf`, so the download cannot continue (`getMediaData()`, `saveMediaData()`, `saveMediaDataPart()`) |
+| 20007 | `WECOM_ERR_NOT_INIT` | The object has no SDK instance, e.g. it was created without running the constructor (all SDK methods) |
+| 20008 | `WECOM_ERR_RESUME` | Cannot resume: `$partPath` is missing or shorter than `offset`, or `indexbuf` continues at a different offset (`saveMediaDataPart()`) |
 
 Codes 100xx come from the WeCom SDK and are passed through unchanged; codes 200xx are raised by the extension itself.
 

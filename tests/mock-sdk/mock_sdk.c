@@ -3,8 +3,8 @@
  *
  * Exports the same C ABI as the official SDK, so the extension can load it through the
  * "lib_path" constructor option. GetMediaData serves a local file in chunks and can inject
- * error codes, which lets the tests exercise multi-chunk downloads, zero-byte files, retries
- * and leak checks without WeCom credentials.
+ * error codes and delays, which lets the tests exercise multi-chunk downloads, zero-byte
+ * files, retries, time limits and resuming without WeCom credentials.
  *
  * The sdkfileid is a ';'-separated list of key=value pairs:
  *   file=/path      file to serve (required)
@@ -13,9 +13,15 @@
  *   fail_code=C     error code returned for that chunk (default 10001)
  *   fail_times=T    how many consecutive calls for that chunk fail (default 1)
  *   error=C         fail every call with C
+ *   delay_ms=D      sleep D ms in every call before answering (a slow network: blocks
+ *                   without using CPU, so max_execution_time does not notice it)
+ *   no_outindex=K   chunk index K is returned unfinished but without outindexbuf
+ *   log=/path       append one line per call: "<monotonic ms> <timeout> <indexbuf>"
  *
- * indexbuf/outindexbuf are "idx-<offset>"; any other non-empty indexbuf returns 10000, which
- * catches an extension that does not pass outindexbuf back verbatim.
+ * indexbuf/outindexbuf have the official SDK's form "Range:bytes=<start>-<end>" (the SDK
+ * v3_20250205 starts with "Range:bytes=0-524287" and formats the next token with
+ * "Range:bytes=%llu-%llu"); any other non-empty indexbuf returns 10000, which catches an
+ * extension that does not pass outindexbuf back verbatim.
  */
 
 #include <errno.h>
@@ -24,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct WeWorkFinanceSdk_t { int unused; } WeWorkFinanceSdk_t;
@@ -43,11 +50,14 @@ typedef struct MediaData_t {
 
 typedef struct {
     char file[1024];
+    char log[1024];
     long chunk;
     long fail_at;
     int fail_code;
     int fail_times;
     int error;
+    long delay_ms;
+    long no_outindex;
 } mock_spec;
 
 /* Consecutive failures served for the current (sdkfileid, indexbuf) pair */
@@ -63,6 +73,7 @@ static int parse_spec(const char *sdkfileid, mock_spec *spec) {
     spec->fail_at = -1;
     spec->fail_code = 10001;
     spec->fail_times = 1;
+    spec->no_outindex = -1;
 
     if (strlen(sdkfileid) >= sizeof(buf)) {
         return -1;
@@ -79,6 +90,8 @@ static int parse_spec(const char *sdkfileid, mock_spec *spec) {
 
         if (strcmp(key, "file") == 0) {
             snprintf(spec->file, sizeof(spec->file), "%s", val);
+        } else if (strcmp(key, "log") == 0) {
+            snprintf(spec->log, sizeof(spec->log), "%s", val);
         } else if (strcmp(key, "chunk") == 0) {
             spec->chunk = atol(val);
         } else if (strcmp(key, "fail_at") == 0) {
@@ -89,10 +102,28 @@ static int parse_spec(const char *sdkfileid, mock_spec *spec) {
             spec->fail_times = atoi(val);
         } else if (strcmp(key, "error") == 0) {
             spec->error = atoi(val);
+        } else if (strcmp(key, "delay_ms") == 0) {
+            spec->delay_ms = atol(val);
+        } else if (strcmp(key, "no_outindex") == 0) {
+            spec->no_outindex = atol(val);
         }
     }
 
     return (spec->file[0] && spec->chunk > 0) ? 0 : -1;
+}
+
+static void log_call(const mock_spec *spec, const char *indexbuf, int timeout) {
+    if (!spec->log[0]) {
+        return;
+    }
+    FILE *fp = fopen(spec->log, "a");
+    if (!fp) {
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(fp, "%lld %d %s\n", (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000, timeout, indexbuf);
+    fclose(fp);
 }
 
 WeWorkFinanceSdk_t *NewSdk(void) {
@@ -144,21 +175,24 @@ void FreeMediaData(MediaData_t *media) {
 
 int GetMediaData(WeWorkFinanceSdk_t *sdk, const char *indexbuf, const char *sdkfileid,
                  const char *proxy, const char *passwd, int timeout, MediaData_t *media) {
-    (void)sdk; (void)proxy; (void)passwd; (void)timeout;
+    (void)sdk; (void)proxy; (void)passwd;
     mock_spec spec;
-    long offset = 0;
+    long offset = 0, range_end = -1;
 
     if (!indexbuf || !sdkfileid || !media || parse_spec(sdkfileid, &spec) != 0) {
         return 10000;
+    }
+    log_call(&spec, indexbuf, timeout);
+    if (spec.delay_ms > 0) {
+        usleep((useconds_t)(spec.delay_ms * 1000));
     }
     if (spec.error) {
         return spec.error;
     }
     if (indexbuf[0] != '\0') {
-        if (strncmp(indexbuf, "idx-", 4) != 0) {
+        if (sscanf(indexbuf, "Range:bytes=%ld-%ld", &offset, &range_end) != 2 || offset < 0 || range_end < offset) {
             return 10000;
         }
-        offset = atol(indexbuf + 4);
     }
 
     char call[sizeof(last_call)];
@@ -184,6 +218,9 @@ int GetMediaData(WeWorkFinanceSdk_t *sdk, const char *indexbuf, const char *sdkf
 
     long remaining = (long)st.st_size - offset;
     long len = remaining < spec.chunk ? remaining : spec.chunk;
+    if (range_end >= 0 && range_end - offset + 1 < len) {
+        len = range_end - offset + 1;
+    }
     if (len < 0) {
         close(fd);
         return 10000;
@@ -200,9 +237,12 @@ int GetMediaData(WeWorkFinanceSdk_t *sdk, const char *indexbuf, const char *sdkf
 
     media->data_len = (int)len;
     media->is_finish = (offset + len >= (long)st.st_size);
+    if (!media->is_finish && spec.no_outindex >= 0 && offset == spec.no_outindex * spec.chunk) {
+        return 0;
+    }
     if (!media->is_finish) {
         char next[64];
-        int n = snprintf(next, sizeof(next), "idx-%ld", offset + len);
+        int n = snprintf(next, sizeof(next), "Range:bytes=%ld-%ld", offset + len, offset + len + spec.chunk - 1);
         media->outindexbuf = strdup(next);
         media->out_len = n;
     }

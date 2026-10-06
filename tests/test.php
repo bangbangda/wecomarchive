@@ -22,7 +22,7 @@ test(
 );
 
 // Test 3: Check methods exist
-$methods = ['__construct', 'getChatData', 'decryptData', 'decryptChatItem', 'getMediaData', 'saveMediaData', 'getSdkVersion'];
+$methods = ['__construct', 'getChatData', 'decryptData', 'decryptChatItem', 'getMediaData', 'saveMediaData', 'saveMediaDataPart', 'getSdkVersion'];
 foreach ($methods as $method) {
     test(
         "Method {$method}() exists",
@@ -62,6 +62,11 @@ $constants = [
     'WECOM_ERR_WRITE' => 20001,
     'WECOM_ERR_MD5' => 20002,
     'WECOM_ERR_PATH' => 20003,
+    'WECOM_ERR_TIMEOUT' => 20004,
+    'WECOM_ERR_EXEC_TIME' => 20005,
+    'WECOM_ERR_INDEXBUF' => 20006,
+    'WECOM_ERR_NOT_INIT' => 20007,
+    'WECOM_ERR_RESUME' => 20008,
 ];
 
 foreach ($constants as $name => $expected) {
@@ -176,8 +181,8 @@ try {
 
 // Test 14: extension version
 test(
-    "Extension version is 1.3.0",
-    phpversion('wecomarchive') === '1.3.0',
+    "Extension version is 1.4.0",
+    phpversion('wecomarchive') === '1.4.0',
     "Got: " . var_export(phpversion('wecomarchive'), true)
 );
 
@@ -194,6 +199,21 @@ test(
         && $method->getNumberOfRequiredParameters() === 2
         && $signature === ['string $sdkFileId', 'string $path', 'array $options = array (' . "\n" . ')']
         && (string)$method->getReturnType() === 'int',
+    "Got: (" . implode(', ', $signature) . "): " . $method->getReturnType()
+);
+
+// Test 15b: saveMediaDataPart() signature
+$method = new ReflectionMethod('WeComArchive', 'saveMediaDataPart');
+$signature = array_map(function (ReflectionParameter $p) {
+    return $p->getType() . ' $' . $p->getName()
+        . ($p->isDefaultValueAvailable() ? ' = ' . var_export($p->getDefaultValue(), true) : '');
+}, $method->getParameters());
+test(
+    "saveMediaDataPart() signature",
+    $method->isPublic() && !$method->isStatic()
+        && $method->getNumberOfRequiredParameters() === 2
+        && $signature === ['string $sdkFileId', 'string $partPath', 'array $options = array (' . "\n" . ')']
+        && (string)$method->getReturnType() === 'array',
     "Got: (" . implode(', ', $signature) . "): " . $method->getReturnType()
 );
 

@@ -193,6 +193,11 @@ $bytes = $archive->saveMediaData($msg['file']['sdkfileid'], '/data/media/' . $ms
 (`max_execution_time` counts CPU time on Linux and does not). When it runs out, the download stops before the
 next chunk, the temporary file is removed and `WECOM_ERR_TIMEOUT` is thrown.
 
+It is checked before every chunk request, not enforced as a hard limit. The SDK takes whole seconds, so a chunk
+requested just before the deadline gets a 1-second timeout and can end up to about 1 s late. Flushing the file
+to disk after the last chunk (and, for `saveMediaDataPart()`, the md5 read-back) is not limited by it either.
+Leave headroom between `max_seconds` and any outer job timeout.
+
 The data goes to a temporary `<path>.part-<random>` file next to the target, which is flushed to disk
 (`fsync`) and renamed onto `<path>` only after the whole download (and the md5 check) succeeded. On any
 failure the temporary file is removed, `<path>` is left as it was, and an exception is thrown. These
@@ -233,8 +238,10 @@ if ($result['finished']) {
 `offset` is the number of bytes the caller knows to be in the file; whatever lies beyond it (written by a
 call whose result was never recorded, e.g. because the process was killed) is cut off before the download
 continues. Running out of `max_seconds` is not an error: the call returns `finished => false`. Exceptions
-are thrown only for real failures, and then `$partPath` is left as it is, so the caller can resume from its
-last recorded state. The method never renames the file: the caller decides where the finished file goes.
+are thrown only for real failures. `$partPath` is never deleted, but by then it may already have been emptied
+(`offset` 0) or cut back to `offset`, and it may hold bytes written after that, so always resume from the last
+state you recorded, never from the file size. The method never renames the file: the caller decides where the
+finished file goes.
 
 The resume token is the SDK's own `outindexbuf`. For SDK v3_20250205 it is the text
 `Range:bytes=<start>-<end>`, i.e. the HTTP byte range of the next chunk, which carries no session state and
@@ -378,7 +385,7 @@ chunk size (at most 512 KB), not on the file size.
   - `proxy`, `passwd`: same as `getChatData()`
   - `timeout`: timeout in seconds for each chunk (default 5). A positive int, float or numeric string; fractions are rounded up, anything else throws `WECOM_ERR_PARAM`
   - `retries`: how many times a chunk that fails with 10001–10003 is retried with the same arguments, as the SDK documentation recommends (default 2). Retries wait 200 ms × the retry number, never longer than the remaining `max_seconds`
-  - `max_seconds`: wall-clock limit for the whole call as a positive int or float (default: none). Checked before every chunk request, including retries; the per-chunk `timeout` is cut down to the remaining time (at least 1 s). When it runs out, `WECOM_ERR_TIMEOUT` is thrown
+  - `max_seconds`: wall-clock budget for the whole call as a positive int or float (default: none). Checked before every chunk request, including retries; the per-chunk `timeout` is cut down to the remaining time (at least 1 s). When it runs out, `WECOM_ERR_TIMEOUT` is thrown. Not a hard limit: the last chunk may end up to about 1 s late, and the final `fsync` is not counted against it
   - `md5`: expected MD5 of the file as 32 hex characters, e.g. the message's `md5sum`; computed while writing
 
 **Returns:** Number of bytes written (0 for an empty file, which is still created)
@@ -388,7 +395,8 @@ chunk size (at most 512 KB), not on the file size.
 `WECOM_ERR_MD5` (checksum mismatch), `WECOM_ERR_TIMEOUT` (`max_seconds` ran out), `WECOM_ERR_INDEXBUF`
 (unusable SDK response), `WECOM_ERR_EXEC_TIME` (`max_execution_time` ran out) or `WECOM_ERR_PARAM`
 (invalid option). In every case `$path` is left as it was and no temporary file remains. After a successful
-rename the directory is fsync'ed as well. If `max_execution_time` runs out during a download, the
+rename the directory is fsync'ed as well; this is best effort, and a failure to sync the directory is not
+reported. If `max_execution_time` runs out during a download, the
 download stops before the next chunk and removes the temporary file before the fatal error, so normally
 nothing is left behind; if it runs out while the last chunk is being fetched, the complete file is still
 moved into place first.
@@ -404,23 +412,27 @@ file to disk and report where the download stopped. See [Resumable Downloads](#r
 
 **Parameters:**
 - `$sdkFileId`: The `sdkfileid` from message
-- `$partPath`: Local file that receives the data, with the same path rules as `saveMediaData()`. With `offset` 0 it is created or emptied; otherwise it must exist and be at least `offset` bytes long, and is truncated to `offset` before the download continues
+- `$partPath`: Local file that receives the data, with the same path rules as `saveMediaData()`. With `offset` 0 it is created or emptied; otherwise it must exist and be at least `offset` bytes long, and is truncated to `offset` before the download continues. A symlink is followed. Nothing is created or truncated until the opened file is known to be the one that was checked: if the path is replaced in between, `WECOM_ERR_PATH` is thrown
 - `$options`: Optional settings
   - `indexbuf`: the `indexbuf` returned by the previous call (default `''`, the start of the file). Required when `offset` > 0
   - `offset`: number of bytes already in `$partPath` from previous calls (default 0)
   - `max_seconds`, `timeout`, `retries`, `proxy`, `passwd`: as for `saveMediaData()`
-  - `md5`: expected MD5; checked by reading the file back once the download is finished
+  - `md5`: expected MD5; checked once the download is finished, by reading back the file that was written (not whatever the path names by then)
 
 **Returns:** `['finished' => bool, 'indexbuf' => string, 'bytes' => int]`. `finished` is true once the last
 chunk was written; `indexbuf` is the token for the next call (`''` when finished); `bytes` is the size of
 `$partPath` now. Running out of `max_seconds` returns `finished => false`; it is not an error. The file is
-flushed with `fsync()` before every return.
+flushed with `fsync()` before every return, and PHP's stat cache is cleared so that `filesize()` sees the new
+size. When the call created the file, its directory is fsync'ed too (best effort, not reported): if the entry
+is lost in a crash anyway, the next call with `offset` > 0 fails with `WECOM_ERR_RESUME` and the download has
+to start over.
 
 **Throws:** an `Exception` whose code is either the SDK error code, or `WECOM_ERR_PATH`, `WECOM_ERR_WRITE`,
 `WECOM_ERR_MD5` (the finished file does not match `md5`), `WECOM_ERR_RESUME` (`$partPath` is missing or
 shorter than `offset`, or `indexbuf` belongs to a different offset), `WECOM_ERR_INDEXBUF`,
-`WECOM_ERR_EXEC_TIME` or `WECOM_ERR_PARAM`. On an exception `$partPath` is never deleted: it holds the
-bytes known to the caller (and possibly more), so the caller can resume from its last recorded state.
+`WECOM_ERR_EXEC_TIME` or `WECOM_ERR_PARAM`. On an exception `$partPath` is never deleted. It may already have
+been emptied or truncated to `offset`, and may hold bytes written before the failure; resume from the last
+state you recorded.
 
 #### getSdkVersion
 
@@ -448,7 +460,7 @@ Get the SDK version.
 | 10011 | `WECOM_ERR_CERT` | Certificate error |
 | 20001 | `WECOM_ERR_WRITE` | Failed to write the target file (`saveMediaData()`) |
 | 20002 | `WECOM_ERR_MD5` | Downloaded file does not match the `md5` option (`saveMediaData()`) |
-| 20003 | `WECOM_ERR_PATH` | Invalid target path: not local, outside `open_basedir`, directory missing, an existing directory or other non-regular file, or an existing target that cannot be inspected (`saveMediaData()`, `saveMediaDataPart()`) |
+| 20003 | `WECOM_ERR_PATH` | Invalid target path: not local, outside `open_basedir`, directory missing, an existing directory or other non-regular file, or an existing target that cannot be inspected (`saveMediaData()`, `saveMediaDataPart()`); for `saveMediaDataPart()` also a `$partPath` that was replaced, created or removed while it was being opened |
 | 20004 | `WECOM_ERR_TIMEOUT` | The `max_seconds` option ran out before the download finished (`getMediaData()`, `saveMediaData()`) |
 | 20005 | `WECOM_ERR_EXEC_TIME` | `max_execution_time` ran out during a download; the engine's fatal error follows (`getMediaData()`, `saveMediaData()`, `saveMediaDataPart()`) |
 | 20006 | `WECOM_ERR_INDEXBUF` | The SDK returned an unfinished chunk without a new `outindexbuf`, so the download cannot continue (`getMediaData()`, `saveMediaData()`, `saveMediaDataPart()`) |

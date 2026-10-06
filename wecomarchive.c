@@ -484,6 +484,21 @@ PHP_METHOD(WeComArchive, __construct)
 }
 /* }}} */
 
+/* Look up an option in an options array. A value held by reference (['timeout' => &$t]) is
+   read through the reference, and null counts as not given. Returns NULL if not given. */
+static zval *find_option(HashTable *options_ht, const char *name, size_t name_len) {
+    zval *value = zend_hash_str_find(options_ht, name, name_len);
+    if (value) {
+        ZVAL_DEREF(value);
+        if (Z_TYPE_P(value) == IS_NULL) {
+            return NULL;
+        }
+    }
+    return value;
+}
+
+#define FIND_OPTION(ht, name) find_option((ht), (name), sizeof(name) - 1)
+
 /* Read a timeout option given in seconds as an int, float or numeric string: anything else,
    and values that are not positive, are rejected rather than silently replaced by the
    default. Fractions are rounded up, since the SDK takes whole seconds. Returns FAILURE
@@ -549,18 +564,18 @@ PHP_METHOD(WeComArchive, getChatData)
         HashTable *options_ht = Z_ARRVAL_P(options);
         zval *tmp;
 
-        tmp = zend_hash_str_find(options_ht, "proxy", sizeof("proxy") - 1);
+        tmp = FIND_OPTION(options_ht, "proxy");
         if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
             proxy = Z_STRVAL_P(tmp);
         }
 
-        tmp = zend_hash_str_find(options_ht, "passwd", sizeof("passwd") - 1);
+        tmp = FIND_OPTION(options_ht, "passwd");
         if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
             passwd = Z_STRVAL_P(tmp);
         }
 
-        tmp = zend_hash_str_find(options_ht, "timeout", sizeof("timeout") - 1);
-        if (tmp && Z_TYPE_P(tmp) != IS_NULL && parse_seconds_option(tmp, "timeout", &timeout) == FAILURE) {
+        tmp = FIND_OPTION(options_ht, "timeout");
+        if (tmp && parse_seconds_option(tmp, "timeout", &timeout) == FAILURE) {
             RETURN_THROWS();
         }
     }
@@ -783,23 +798,23 @@ static int parse_media_options(zval *options, media_options *opts) {
     HashTable *options_ht = Z_ARRVAL_P(options);
     zval *tmp;
 
-    tmp = zend_hash_str_find(options_ht, "proxy", sizeof("proxy") - 1);
+    tmp = FIND_OPTION(options_ht, "proxy");
     if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
         opts->proxy = Z_STRVAL_P(tmp);
     }
 
-    tmp = zend_hash_str_find(options_ht, "passwd", sizeof("passwd") - 1);
+    tmp = FIND_OPTION(options_ht, "passwd");
     if (tmp && Z_TYPE_P(tmp) == IS_STRING) {
         opts->passwd = Z_STRVAL_P(tmp);
     }
 
-    tmp = zend_hash_str_find(options_ht, "timeout", sizeof("timeout") - 1);
-    if (tmp && Z_TYPE_P(tmp) != IS_NULL && parse_seconds_option(tmp, "timeout", &opts->timeout) == FAILURE) {
+    tmp = FIND_OPTION(options_ht, "timeout");
+    if (tmp && parse_seconds_option(tmp, "timeout", &opts->timeout) == FAILURE) {
         return FAILURE;
     }
 
-    tmp = zend_hash_str_find(options_ht, "retries", sizeof("retries") - 1);
-    if (tmp && Z_TYPE_P(tmp) != IS_NULL) {
+    tmp = FIND_OPTION(options_ht, "retries");
+    if (tmp) {
         if (Z_TYPE_P(tmp) != IS_LONG || Z_LVAL_P(tmp) < 0) {
             zend_throw_exception(zend_ce_exception, "Option 'retries' must be a non-negative integer", WECOM_ERR_PARAM);
             return FAILURE;
@@ -807,8 +822,8 @@ static int parse_media_options(zval *options, media_options *opts) {
         opts->retries = Z_LVAL_P(tmp);
     }
 
-    tmp = zend_hash_str_find(options_ht, "max_seconds", sizeof("max_seconds") - 1);
-    if (tmp && Z_TYPE_P(tmp) != IS_NULL) {
+    tmp = FIND_OPTION(options_ht, "max_seconds");
+    if (tmp) {
         double max_seconds;
         if (Z_TYPE_P(tmp) == IS_LONG) {
             max_seconds = (double)Z_LVAL_P(tmp);
@@ -835,8 +850,8 @@ static int parse_md5_option(zval *options, zend_string **expected_md5) {
         return SUCCESS;
     }
 
-    zval *tmp = zend_hash_str_find(Z_ARRVAL_P(options), "md5", sizeof("md5") - 1);
-    if (tmp && Z_TYPE_P(tmp) != IS_NULL) {
+    zval *tmp = FIND_OPTION(Z_ARRVAL_P(options), "md5");
+    if (tmp) {
         if (Z_TYPE_P(tmp) != IS_STRING || Z_STRLEN_P(tmp) != 32
             || strspn(Z_STRVAL_P(tmp), "0123456789abcdefABCDEF") != 32) {
             zend_throw_exception(zend_ce_exception, "Option 'md5' must be a 32-character hexadecimal string", WECOM_ERR_PARAM);
@@ -1386,33 +1401,26 @@ static bool media_indexbuf_offset(const char *indexbuf, zend_long *start) {
     return true;
 }
 
-/* Compute the md5 of the file at path by reading it in chunks and compare it with expected.
-   Returns FAILURE with an exception thrown (WECOM_ERR_WRITE if the file cannot be read,
-   WECOM_ERR_MD5 on a mismatch). */
-static int media_verify_file_md5(const char *target, const char *display_path, zend_string *expected_md5) {
-    int flags = O_RDONLY;
-#ifdef O_CLOEXEC
-    flags |= O_CLOEXEC;
-#endif
-    int fd = open(target, flags);
-    if (fd < 0) {
-        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to read back '%s' for the md5 check: %s", display_path, strerror(errno));
-        return FAILURE;
-    }
-
+/* Compute the md5 of the file open as fd by reading it from the start in chunks, and compare
+   it with expected. Reading through the descriptor that was written checks the very file that
+   received the data, even if the path has been pointed elsewhere meanwhile. Returns FAILURE
+   with an exception thrown (WECOM_ERR_WRITE if the file cannot be read, WECOM_ERR_MD5 on a
+   mismatch). */
+static int media_verify_fd_md5(int fd, const char *display_path, zend_string *expected_md5) {
     const size_t buf_size = 512 * 1024;
     char *buf = emalloc(buf_size);
     PHP_MD5_CTX md5;
+    off_t pos = 0;
+
     PHP_MD5Init(&md5);
     for (;;) {
-        ssize_t n = read(fd, buf, buf_size);
+        ssize_t n = pread(fd, buf, buf_size, pos);
         if (n < 0 && errno == EINTR) {
             continue;
         }
         if (n < 0) {
             int err = errno;
             efree(buf);
-            close(fd);
             zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to read back '%s' for the md5 check: %s", display_path, strerror(err));
             return FAILURE;
         }
@@ -1420,9 +1428,9 @@ static int media_verify_file_md5(const char *target, const char *display_path, z
             break;
         }
         PHP_MD5Update(&md5, buf, (size_t)n);
+        pos += n;
     }
     efree(buf);
-    close(fd);
 
     unsigned char digest[16];
     char actual[33];
@@ -1434,6 +1442,65 @@ static int media_verify_file_md5(const char *target, const char *display_path, z
         return FAILURE;
     }
     return SUCCESS;
+}
+
+/* Open the part file of saveMediaDataPart() for writing, positioned at offset, and return the
+   descriptor, or -1 with an exception thrown.
+
+   target is the absolute path from resolve_media_target(), and *existing / exists what it found
+   there. The file is opened with a plain open(): in ZTS builds VCWD_OPEN would resolve a
+   symlinked target through PHP's realpath cache, which may still point at a file the link no
+   longer names. Nothing is truncated until the open descriptor is known to be the file that
+   was checked, so a path replaced in between (another file, or a symlink to one outside
+   open_basedir) is refused with WECOM_ERR_PATH instead of being emptied. A file that did not
+   exist is created with O_EXCL for the same reason. With md5 the descriptor is opened for
+   reading too, so that the check reads back this file. */
+static int media_open_part(const char *target, const char *display_path, const zend_stat_t *existing, bool exists,
+                           zend_long offset, bool readable) {
+    int flags = (readable ? O_RDWR : O_WRONLY) | (exists ? 0 : O_CREAT | O_EXCL);
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int fd = open(target, flags, 0666);
+    if (fd < 0) {
+        if (!exists && errno == EEXIST) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "'%s' was created by someone else while it was being opened", display_path);
+        } else if (exists && errno == ENOENT) {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "'%s' was removed while it was being opened", display_path);
+        } else {
+            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to open '%s' for writing: %s", display_path, strerror(errno));
+        }
+        return -1;
+    }
+
+    zend_stat_t st;
+    if (fstat(fd, &st) != 0) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to inspect '%s': %s", display_path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (exists && (st.st_dev != existing->st_dev || st.st_ino != existing->st_ino || !S_ISREG(st.st_mode))) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_PATH, "'%s' was replaced while it was being opened", display_path);
+        close(fd);
+        return -1;
+    }
+    if ((zend_long)st.st_size < offset) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_RESUME, "Cannot continue at offset %lld: '%s' is only %lld bytes",
+            (long long)offset, display_path, (long long)st.st_size);
+        close(fd);
+        return -1;
+    }
+
+    /* offset 0 starts over; offset > 0 drops whatever lies beyond the offset, which the caller
+       never recorded (a previous process may have died after writing it) */
+    if ((st.st_size != (off_t)offset && ftruncate(fd, (off_t)offset) != 0)
+        || lseek(fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to truncate '%s' to %lld bytes: %s",
+            display_path, (long long)offset, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 /* {{{ proto array WeComArchive::saveMediaDataPart(string $sdkFileId, string $partPath, array $options = [])
@@ -1460,8 +1527,8 @@ PHP_METHOD(WeComArchive, saveMediaDataPart)
     }
 
     if (options) {
-        zval *tmp = zend_hash_str_find(Z_ARRVAL_P(options), "indexbuf", sizeof("indexbuf") - 1);
-        if (tmp && Z_TYPE_P(tmp) != IS_NULL) {
+        zval *tmp = FIND_OPTION(Z_ARRVAL_P(options), "indexbuf");
+        if (tmp) {
             if (Z_TYPE_P(tmp) != IS_STRING) {
                 zend_throw_exception(zend_ce_exception, "Option 'indexbuf' must be a string", WECOM_ERR_PARAM);
                 RETURN_THROWS();
@@ -1469,8 +1536,8 @@ PHP_METHOD(WeComArchive, saveMediaDataPart)
             indexbuf = Z_STRVAL_P(tmp);
         }
 
-        tmp = zend_hash_str_find(Z_ARRVAL_P(options), "offset", sizeof("offset") - 1);
-        if (tmp && Z_TYPE_P(tmp) != IS_NULL) {
+        tmp = FIND_OPTION(Z_ARRVAL_P(options), "offset");
+        if (tmp) {
             if (Z_TYPE_P(tmp) != IS_LONG || Z_LVAL_P(tmp) < 0) {
                 zend_throw_exception(zend_ce_exception, "Option 'offset' must be a non-negative integer", WECOM_ERR_PARAM);
                 RETURN_THROWS();
@@ -1522,56 +1589,45 @@ PHP_METHOD(WeComArchive, saveMediaDataPart)
         }
     }
 
-    /* offset 0 starts over: create the file, or empty an existing one. offset > 0 opens the
-       existing file and drops whatever lies beyond the offset, which the caller never recorded
-       (a previous process may have died after writing it). A new file gets 0666 minus the umask. */
-    int open_flags = O_WRONLY | (offset == 0 ? O_CREAT | O_TRUNC : 0);
-#ifdef O_CLOEXEC
-    open_flags |= O_CLOEXEC;
-#endif
-    int fd = VCWD_OPEN_MODE(ZSTR_VAL(target), open_flags, 0666);
+    int fd = media_open_part(ZSTR_VAL(target), ZSTR_VAL(path), &existing, exists, offset, expected_md5 != NULL);
     if (fd < 0) {
-        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to open '%s' for writing: %s", ZSTR_VAL(path), strerror(errno));
         zend_string_release(target);
         RETURN_THROWS();
     }
 
-    if (offset > 0) {
-        zend_stat_t st;
-        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || (zend_long)st.st_size < offset) {
-            close(fd);
-            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_RESUME, "Cannot continue at offset %lld: '%s' changed while it was being opened",
-                (long long)offset, ZSTR_VAL(path));
-            zend_string_release(target);
-            RETURN_THROWS();
-        }
-        if (ftruncate(fd, (off_t)offset) != 0 || lseek(fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
-            zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to truncate '%s' to %lld bytes: %s",
-                ZSTR_VAL(path), (long long)offset, strerror(errno));
-            close(fd);
-            zend_string_release(target);
-            RETURN_THROWS();
-        }
+    /* From here on the file may have been created, truncated or written: PHP's stat cache
+       (filesize() and friends) must not keep describing the old file, whatever the outcome.
+       PHP < 8.3 does not do this for writes through a descriptor. */
+    int result = SUCCESS;
+    bool finished = false;
+    zend_string *next_indexbuf = NULL;
+    media_file_writer writer = { .path = ZSTR_VAL(path), .verify_md5 = false };
+
+    /* Keeps the file open for the md5 read-back once the stream has closed its descriptor */
+    int md5_fd = -1;
+    if (expected_md5 && (md5_fd = dup(fd)) < 0) {
+        zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to open '%s' for the md5 check: %s", ZSTR_VAL(path), strerror(errno));
+        close(fd);
+        result = FAILURE;
+        goto done;
     }
 
     php_stream *stream = php_stream_fopen_from_fd(fd, "wb", NULL);
     if (!stream) {
         close(fd);
         zend_throw_exception_ex(zend_ce_exception, WECOM_ERR_WRITE, "Failed to open '%s' for writing", ZSTR_VAL(path));
-        zend_string_release(target);
-        RETURN_THROWS();
+        result = FAILURE;
+        goto done;
     }
     stream->flags |= PHP_STREAM_FLAG_SUPPRESS_ERRORS;
 
     /* The md5 is checked by reading the finished file back: a running digest cannot survive
        between calls */
-    media_file_writer writer = { .stream = stream, .path = ZSTR_VAL(path), .verify_md5 = false };
-    bool finished = false;
-    zend_string *next_indexbuf = NULL;
+    writer.stream = stream;
     double deadline = opts.max_seconds > 0 ? start + opts.max_seconds : 0;
 
-    int result = fetch_media_chunks(intern->sdk, ZSTR_VAL(sdk_file_id), &opts, indexbuf, deadline, media_write_to_file, &writer,
-                                    &finished, &next_indexbuf);
+    result = fetch_media_chunks(intern->sdk, ZSTR_VAL(sdk_file_id), &opts, indexbuf, deadline, media_write_to_file, &writer,
+                                &finished, &next_indexbuf);
 
     /* Whatever was written stays in the file, so flush it to disk even when giving up: the
        caller may keep the bytes it has recorded. Only a successful call reports sync errors. */
@@ -1594,9 +1650,14 @@ PHP_METHOD(WeComArchive, saveMediaDataPart)
     }
 
     if (result == SUCCESS && finished && expected_md5) {
-        result = media_verify_file_md5(ZSTR_VAL(target), ZSTR_VAL(path), expected_md5);
+        result = media_verify_fd_md5(md5_fd, ZSTR_VAL(path), expected_md5);
     }
 
+done:
+    if (md5_fd >= 0) {
+        close(md5_fd);
+    }
+    php_clear_stat_cache(0, NULL, 0);
     zend_string_release(target);
     if (result == FAILURE) {
         if (next_indexbuf) {

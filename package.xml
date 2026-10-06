@@ -30,7 +30,9 @@
   - saveMediaData()/getMediaData(): "max_seconds" wall-clock limit (WECOM_ERR_TIMEOUT, 20004)
   - New saveMediaDataPart(): resumable downloads across calls and processes (indexbuf/offset)
   - Retries of 10001-10003 back off 200 ms x attempt; the directory is fsync'ed after rename
-  - "timeout" accepts int/float/numeric string and rejects anything else with WECOM_ERR_PARAM
+  - "timeout" accepts int/float/numeric string and rejects anything else with WECOM_ERR_PARAM (int 0/negative now rejected too, see CHANGELOG.md)
+  - saveMediaDataPart() opens the part file by identity, reads the md5 back from the same file and clears the stat cache
+  - Options passed by reference are honoured
   - New error codes WECOM_ERR_EXEC_TIME (20005), WECOM_ERR_INDEXBUF (20006), WECOM_ERR_NOT_INIT (20007), WECOM_ERR_RESUME (20008)
   1.3.0:
   - saveMediaData() - Stream media files to disk chunk by chunk (atomic rename, retries, md5 check)

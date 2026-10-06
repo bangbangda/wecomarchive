@@ -25,7 +25,7 @@ $shapeOk = $tokenOk = $bytesOk = true;
 do {
     $r = $archive->saveMediaDataPart(mock_spec($src, ['delay_ms' => 120]), $part, $state + ['max_seconds' => 0.25]);
     $calls++;
-    clearstatcache();
+    // No clearstatcache(): the method must not leave filesize() describing the old file
     $shapeOk = $shapeOk && is_array($r) && array_keys($r) === ['finished', 'indexbuf', 'bytes']
         && is_bool($r['finished']) && is_string($r['indexbuf']) && is_int($r['bytes']);
     $bytesOk = $bytesOk && $r['bytes'] === filesize($part);
@@ -70,7 +70,6 @@ check('a file:// path works', $r['finished'] && md5_file("{$dir}/wrapper.part") 
 // New files follow the umask
 umask(022);
 $archive->saveMediaDataPart(mock_spec($src), "{$dir}/mode.part", ['max_seconds' => 60]);
-clearstatcache();
 check('a new part file is created according to the umask', (fileperms("{$dir}/mode.part") & 0777) === 0644, sprintf('%o', fileperms("{$dir}/mode.part") & 0777));
 ?>
 --EXPECT--

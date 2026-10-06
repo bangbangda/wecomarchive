@@ -185,6 +185,9 @@ $bytes = $archive->saveMediaData($msg['file']['sdkfileid'], '/data/media/' . $ms
 `max_seconds` 按单调墙钟计时，等待网络的时间也算在内（Linux 上 `max_execution_time` 按 CPU 时间计，
 等网络时不走）。时间用完时会在拉取下一个分片前停止，删除临时文件并抛出 `WECOM_ERR_TIMEOUT`。
 
+它在每次请求分片前检查，不是硬上限。SDK 只接受整秒，临近截止时发出的那一片会拿到 1 秒超时，最多可能晚约 1 秒结束。
+最后一片之后的落盘（以及 `saveMediaDataPart()` 的 md5 回读）也不计入它。外层任务的超时要给它留出余量。
+
 数据先写到目标旁边的临时文件 `<path>.part-<随机串>`，整个下载（以及 md5 校验）成功后先 `fsync`
 落盘，再原子地 rename 为 `<path>`。任何环节失败都会删除临时文件、保持 `<path>` 原样，并抛出异常。
 以上保证的前提是下载期间目标目录没有被移动或替换。
@@ -219,8 +222,9 @@ if ($result['finished']) {
 ```
 
 `offset` 是调用方确认已写入文件的字节数；超出它的部分（某次调用写入了但结果没来得及记录，例如进程被杀）
-会在继续下载前被截掉。`max_seconds` 用完不算错误，返回 `finished => false`。只有真正出错才抛异常，
-而且出错时不会动 `$partPath`，调用方可以从上次记录的状态继续。方法不会 rename 文件，下载完成后放到哪里由调用方决定。
+会在继续下载前被截掉。`max_seconds` 用完不算错误，返回 `finished => false`。只有真正出错才抛异常。
+出错时不会删除 `$partPath`，但它可能已经被清空（`offset` 为 0）或截断到 `offset`，之后还可能写入了一部分数据，
+所以续传一律以上次记录的状态为准，不要以文件大小为准。方法不会 rename 文件，下载完成后放到哪里由调用方决定。
 
 续传令牌就是 SDK 自己的 `outindexbuf`。SDK v3_20250205 的令牌是文本 `Range:bytes=<start>-<end>`，
 即下一片的 HTTP 字节范围，不含任何会话状态，所以跨进程、跨时间都有效。扩展会检查 `<start>` 是否等于
@@ -361,7 +365,7 @@ public function saveMediaData(string $sdkFileId, string $path, array $options = 
   - `proxy`、`passwd`：同 `getChatData()`
   - `timeout`：每个分片的超时秒数（默认 5）。正数的 int、float 或数字字符串，小数向上取整；其他值抛 `WECOM_ERR_PARAM`
   - `retries`：某个分片返回 10001～10003 时，按官方建议用相同参数重试的次数（默认 2）。每次重试前等待 200ms × 重试次数，且不超过 `max_seconds` 的剩余时间
-  - `max_seconds`：整次调用的墙钟时长上限，大于 0 的 int 或 float（默认不限）。每次请求分片（含重试）前检查；单片 `timeout` 会被压到剩余时间以内（至少 1 秒）。用完时抛 `WECOM_ERR_TIMEOUT`
+  - `max_seconds`：整次调用的墙钟时间预算，大于 0 的 int 或 float（默认不限）。每次请求分片（含重试）前检查；单片 `timeout` 会被压到剩余时间以内（至少 1 秒）。用完时抛 `WECOM_ERR_TIMEOUT`。不是硬上限：最后一片最多可能晚约 1 秒结束，最后的 `fsync` 也不计入
   - `md5`：文件的预期 MD5，32 位十六进制，例如消息里的 `md5sum`；在写入过程中计算
 
 **返回：** 写入的字节数（空文件返回 0，文件仍会被创建）
@@ -370,7 +374,7 @@ public function saveMediaData(string $sdkFileId, string $path, array $options = 
 `WECOM_ERR_PATH`（目标路径不合法）、`WECOM_ERR_WRITE`（写文件失败）、`WECOM_ERR_MD5`（md5 不一致）、
 `WECOM_ERR_TIMEOUT`（`max_seconds` 用完）、`WECOM_ERR_INDEXBUF`（SDK 响应无法继续）、
 `WECOM_ERR_EXEC_TIME`（`max_execution_time` 到期）、`WECOM_ERR_PARAM`（选项不合法）。无论哪种情况，`$path` 都保持原样，
-也不会残留临时文件。rename 成功后还会对所在目录做一次 fsync。
+也不会残留临时文件。rename 成功后还会对所在目录做一次 fsync，这一步尽力而为，目录同步失败不会报告。
 如果下载过程中 `max_execution_time` 到期，会在拉取下一个分片前停止并删除临时文件，然后才出现超时致命错误，
 因此通常不会留下残留；如果恰好在拉取最后一个分片时到期，已完整下载的文件仍会先 rename 到位。
 
@@ -385,21 +389,23 @@ public function saveMediaDataPart(string $sdkFileId, string $partPath, array $op
 
 **参数：**
 - `$sdkFileId`：消息中的 `sdkfileid`
-- `$partPath`：接收数据的本地文件，路径规则同 `saveMediaData()`。`offset` 为 0 时创建或清空；否则必须已存在且不小于 `offset` 字节，继续下载前会先截断到 `offset`
+- `$partPath`：接收数据的本地文件，路径规则同 `saveMediaData()`。`offset` 为 0 时创建或清空；否则必须已存在且不小于 `offset` 字节，继续下载前会先截断到 `offset`。符号链接会被跟随。确认打开的正是检查过的那个文件之后才会创建或截断；如果路径在两步之间被替换，抛 `WECOM_ERR_PATH`
 - `$options`：可选设置
   - `indexbuf`：上次调用返回的 `indexbuf`（默认 `''`，从文件开头下载）。`offset` 大于 0 时必填
   - `offset`：此前各次调用已写入 `$partPath` 的字节数（默认 0）
   - `max_seconds`、`timeout`、`retries`、`proxy`、`passwd`：同 `saveMediaData()`
-  - `md5`：预期 MD5；下载完成时以流式读取文件校验
+  - `md5`：预期 MD5；下载完成时流式回读刚写入的那个文件来校验（而不是路径此时指向的文件）
 
 **返回：** `['finished' => bool, 'indexbuf' => string, 'bytes' => int]`。`finished` 为 true 表示最后一片已写入；
 `indexbuf` 是下次调用的令牌（完成时为 `''`）；`bytes` 是 `$partPath` 当前的大小。`max_seconds` 用完返回
-`finished => false`，不算错误。每次返回前都会 `fsync` 文件。
+`finished => false`，不算错误。每次返回前都会 `fsync` 文件，并清除 PHP 的 stat 缓存，`filesize()` 能立即看到新大小。
+本次调用新建了文件时，还会对所在目录 fsync（尽力而为，失败不报告）：万一崩溃后目录项仍然丢失，下次以 `offset` 大于 0
+续传会得到 `WECOM_ERR_RESUME`，需要从头下载。
 
 **异常：** 抛出 `Exception`，code 为 SDK 原始错误码，或 `WECOM_ERR_PATH`、`WECOM_ERR_WRITE`、
 `WECOM_ERR_MD5`（完成的文件与 `md5` 不一致）、`WECOM_ERR_RESUME`（`$partPath` 不存在或小于 `offset`，或 `indexbuf`
-对应另一个偏移）、`WECOM_ERR_INDEXBUF`、`WECOM_ERR_EXEC_TIME`、`WECOM_ERR_PARAM`。抛异常时绝不会删除 `$partPath`：
-它保存着调用方已知的字节（可能还多一些），调用方可以从上次记录的状态继续。
+对应另一个偏移）、`WECOM_ERR_INDEXBUF`、`WECOM_ERR_EXEC_TIME`、`WECOM_ERR_PARAM`。抛异常时不会删除 `$partPath`，
+但它可能已被清空或截断到 `offset`，也可能写入了出错前的部分数据，请从上次记录的状态继续。
 
 #### getSdkVersion
 
@@ -427,7 +433,7 @@ public static function getSdkVersion(): string
 | 10011 | `WECOM_ERR_CERT` | 证书错误 |
 | 20001 | `WECOM_ERR_WRITE` | 写入目标文件失败（`saveMediaData()`） |
 | 20002 | `WECOM_ERR_MD5` | 下载内容与 `md5` 选项不一致（`saveMediaData()`） |
-| 20003 | `WECOM_ERR_PATH` | 目标路径不合法：非本地路径、超出 `open_basedir`、目录不存在、目标已是目录等非普通文件，或已存在的目标无法读取元数据（`saveMediaData()`、`saveMediaDataPart()`） |
+| 20003 | `WECOM_ERR_PATH` | 目标路径不合法：非本地路径、超出 `open_basedir`、目录不存在、目标已是目录等非普通文件，或已存在的目标无法读取元数据（`saveMediaData()`、`saveMediaDataPart()`）；对 `saveMediaDataPart()` 还包括 `$partPath` 在打开过程中被替换、新建或删除 |
 | 20004 | `WECOM_ERR_TIMEOUT` | `max_seconds` 用完时下载还没结束（`getMediaData()`、`saveMediaData()`） |
 | 20005 | `WECOM_ERR_EXEC_TIME` | 下载期间 `max_execution_time` 到期，随后出现引擎的致命错误（`getMediaData()`、`saveMediaData()`、`saveMediaDataPart()`） |
 | 20006 | `WECOM_ERR_INDEXBUF` | SDK 返回了未完成的分片却没有新的 `outindexbuf`，无法继续（`getMediaData()`、`saveMediaData()`、`saveMediaDataPart()`） |
